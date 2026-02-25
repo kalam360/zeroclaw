@@ -5,7 +5,7 @@ set -euo pipefail
 # Installs all CLI tools for agentic daily workflow management.
 # Targets: macOS (Homebrew) — Apple Silicon & Intel
 
-TOOLS_BREW=(himalaya task khard vdirsyncer zk jrnl uv)
+TOOLS_BREW=(himalaya task khard vdirsyncer zk jrnl uv tmux)
 TOOLS_GO=(github.com/mrusme/caldr)
 UV_PYTHON_VERSION="3.13"
 
@@ -160,6 +160,7 @@ check_and_print "Contacts"  "khard"      "khard"
 check_and_print "Sync"      "vdirsyncer" "vdirsyncer"
 check_and_print "Notes/KB"  "zk"         "zk"
 check_and_print "Logging"   "jrnl"       "jrnl"
+check_and_print "Terminal"  "tmux"       "tmux"
 
 echo "────────────────────────────────────────────────"
 
