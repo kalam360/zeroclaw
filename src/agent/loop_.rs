@@ -1,13 +1,17 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::config::schema::ModelPricing;
 use crate::config::Config;
-use crate::memory::{self, Memory, MemoryCategory};
+use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use crate::cost::CostTracker;
+use crate::i18n::ToolDescriptions;
+use crate::memory::{self, decay, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -17,10 +21,112 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+// ── Cost tracking via task-local ──
+
+/// Context for cost tracking within the tool call loop.
+/// Scoped via `tokio::task_local!` at call sites (channels, gateway).
+#[derive(Clone)]
+pub(crate) struct ToolLoopCostTrackingContext {
+    pub tracker: Arc<CostTracker>,
+    pub prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+}
+
+impl ToolLoopCostTrackingContext {
+    pub(crate) fn new(
+        tracker: Arc<CostTracker>,
+        prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+    ) -> Self {
+        Self { tracker, prices }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
+}
+
+/// 3-tier model pricing lookup:
+/// 1. Direct model name
+/// 2. Qualified `provider/model`
+/// 3. Suffix after last `/`
+fn lookup_model_pricing<'a>(
+    prices: &'a std::collections::HashMap<String, ModelPricing>,
+    provider_name: &str,
+    model: &str,
+) -> Option<&'a ModelPricing> {
+    prices
+        .get(model)
+        .or_else(|| prices.get(&format!("{provider_name}/{model}")))
+        .or_else(|| {
+            model
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| prices.get(suffix))
+        })
+}
+
+/// Record token usage from an LLM response via the task-local cost tracker.
+/// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
+fn record_tool_loop_cost_usage(
+    provider_name: &str,
+    model: &str,
+    usage: &crate::providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    if total_tokens == 0 {
+        return None;
+    }
+
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    let pricing = lookup_model_pricing(&ctx.prices, provider_name, model);
+    let cost_usage = CostTokenUsage::new(
+        model,
+        input_tokens,
+        output_tokens,
+        pricing.map_or(0.0, |entry| entry.input),
+        pricing.map_or(0.0, |entry| entry.output),
+    );
+
+    if pricing.is_none() {
+        tracing::debug!(
+            provider = provider_name,
+            model,
+            "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
+        );
+    }
+
+    if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
+        tracing::warn!(
+            provider = provider_name,
+            model,
+            "Failed to record cost tracking usage: {error}"
+        );
+    }
+
+    Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// Check budget before an LLM call. Returns `None` when no cost tracking
+/// context is scoped (tests, delegate, CLI without cost config).
+pub(crate) fn check_tool_loop_budget() -> Option<BudgetCheck> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(|ctx| {
+            ctx.tracker
+                .check_budget(0.0)
+                .unwrap_or(BudgetCheck::Allowed)
+        })
+}
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
@@ -32,6 +138,29 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+/// Callback type for checking if model has been switched during tool execution.
+/// Returns Some((provider, model)) if a switch was requested, None otherwise.
+pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
+
+/// Global model switch request state - used for runtime model switching via model_switch tool.
+/// This is set by the model_switch tool and checked by the agent loop.
+#[allow(clippy::type_complexity)]
+static MODEL_SWITCH_REQUEST: LazyLock<Arc<Mutex<Option<(String, String)>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+/// Get the global model switch request state
+pub fn get_model_switch_state() -> ModelSwitchCallback {
+    Arc::clone(&MODEL_SWITCH_REQUEST)
+}
+
+/// Clear any pending model switch request
+pub fn clear_model_switch_request() {
+    if let Ok(guard) = MODEL_SWITCH_REQUEST.lock() {
+        let mut guard = guard;
+        *guard = None;
+    }
+}
 
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
@@ -91,6 +220,24 @@ pub(crate) fn filter_tool_specs_for_turn(
             })
         })
         .collect()
+}
+
+/// Filters a tool spec list by an optional capability allowlist.
+///
+/// When `allowed` is `None`, all specs pass through unchanged.
+/// When `allowed` is `Some(list)`, only specs whose name appears in the list
+/// are retained. Unknown names in the allowlist are silently ignored.
+pub(crate) fn filter_by_allowed_tools(
+    specs: Vec<crate::tools::ToolSpec>,
+    allowed: Option<&[String]>,
+) -> Vec<crate::tools::ToolSpec> {
+    match allowed {
+        None => specs,
+        Some(list) => specs
+            .into_iter()
+            .filter(|spec| list.iter().any(|name| name == &spec.name))
+            .collect(),
+    }
 }
 
 /// Computes the list of MCP tool names that should be excluded for a given turn
@@ -195,12 +342,28 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Estimate token count for a message history using ~4 chars/token heuristic.
+/// Includes a small overhead per message for role/framing tokens.
+fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .map(|m| {
+            // ~4 chars per token + ~4 framing tokens per message (role, delimiters)
+            m.content.len().div_ceil(4) + 4
+        })
+        .sum()
+}
+
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
 pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+
+tokio::task_local! {
+    pub(crate) static TOOL_CHOICE_OVERRIDE: Option<String>;
+}
 
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
@@ -237,6 +400,15 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
 
 fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
+}
+
+fn memory_session_id_from_state_file(path: &Path) -> Option<String> {
+    let raw = path.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    Some(format!("cli:{raw}"))
 }
 
 /// Trim conversation history to prevent unbounded growth.
@@ -288,6 +460,7 @@ async fn auto_compact_history(
     provider: &dyn Provider,
     model: &str,
     max_history: usize,
+    max_context_tokens: usize,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -296,7 +469,10 @@ async fn auto_compact_history(
         history.len()
     };
 
-    if non_system_count <= max_history {
+    let estimated_tokens = estimate_history_tokens(history);
+
+    // Trigger compaction when either token budget OR message count is exceeded.
+    if estimated_tokens <= max_context_tokens && non_system_count <= max_history {
         return Ok(false);
     }
 
@@ -307,7 +483,16 @@ async fn auto_compact_history(
         return Ok(false);
     }
 
-    let compact_end = start + compact_count;
+    let mut compact_end = start + compact_count;
+
+    // Snap compact_end to a user-turn boundary so we don't split mid-conversation.
+    while compact_end > start && history.get(compact_end).map_or(false, |m| m.role != "user") {
+        compact_end -= 1;
+    }
+    if compact_end <= start {
+        return Ok(false);
+    }
+
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
     let transcript = build_compaction_transcript(&to_compact);
 
@@ -376,11 +561,20 @@ fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Res
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+/// Core memories are exempt from time decay (evergreen).
+async fn build_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_id: Option<&str>,
+) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(mut entries) = mem.recall(user_msg, 5, session_id, None, None).await {
+        // Apply time decay: older non-Core memories score lower
+        decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {
@@ -393,6 +587,9 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
             context.push_str("[Memory context]\n");
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
+                if memory::should_skip_autosave_content(&entry.content) {
                     continue;
                 }
                 // Skip entries containing tool_result blocks — they can leak
@@ -1238,15 +1435,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                 }
             }
         }
-
-        // Plain URL
-        if let Some(command) = build_curl_command(line) {
-            calls.push((
-                "shell".to_string(),
-                serde_json::json!({ "command": command }),
-                Some(line.to_string()),
-            ));
-        }
     }
 
     calls
@@ -2033,9 +2221,20 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-fn resolve_display_text(response_text: &str, parsed_text: &str, has_tool_calls: bool) -> String {
+fn resolve_display_text(
+    response_text: &str,
+    parsed_text: &str,
+    has_tool_calls: bool,
+    has_native_tool_calls: bool,
+) -> String {
     if has_tool_calls {
-        return parsed_text.to_string();
+        if !parsed_text.is_empty() {
+            return parsed_text.to_string();
+        }
+        if has_native_tool_calls {
+            return response_text.to_string();
+        }
+        return String::new();
     }
 
     if parsed_text.is_empty() {
@@ -2067,6 +2266,31 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+#[derive(Debug)]
+pub(crate) struct ModelSwitchRequested {
+    pub provider: String,
+    pub model: String,
+}
+
+impl std::fmt::Display for ModelSwitchRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model switch requested to {} {}",
+            self.provider, self.model
+        )
+    }
+}
+
+impl std::error::Error for ModelSwitchRequested {}
+
+pub(crate) fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
+    err.chain()
+        .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
+        .map(|e| (e.provider.clone(), e.model.clone()))
+        .next()
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -2080,8 +2304,15 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    approval: Option<&ApprovalManager>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -2092,23 +2323,122 @@ pub(crate) async fn agent_turn(
         model,
         temperature,
         silent,
-        None,
-        "channel",
+        approval,
+        channel_name,
+        channel_reply_target,
         multimodal_config,
         max_tool_iterations,
         None,
         None,
         None,
-        &[],
-        &[],
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        &crate::config::PacingConfig::default(),
     )
     .await
+}
+
+fn maybe_inject_channel_delivery_defaults(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+) {
+    if tool_name != "cron_add" {
+        return;
+    }
+
+    if !matches!(
+        channel_name,
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
+    ) {
+        return;
+    }
+
+    let Some(reply_target) = channel_reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+
+    let is_agent_job = args
+        .get("job_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|job_type| job_type.eq_ignore_ascii_case("agent"))
+        || args
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|prompt| !prompt.trim().is_empty());
+    if !is_agent_job {
+        return;
+    }
+
+    let default_delivery = || {
+        serde_json::json!({
+            "mode": "announce",
+            "channel": channel_name,
+            "to": reply_target,
+        })
+    };
+
+    match args.get_mut("delivery") {
+        None => {
+            args.insert("delivery".to_string(), default_delivery());
+        }
+        Some(serde_json::Value::Null) => {
+            *args.get_mut("delivery").expect("delivery key exists") = default_delivery();
+        }
+        Some(serde_json::Value::Object(delivery)) => {
+            if delivery
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("none"))
+            {
+                return;
+            }
+
+            delivery
+                .entry("mode".to_string())
+                .or_insert_with(|| serde_json::Value::String("announce".to_string()));
+
+            let needs_channel = delivery
+                .get("channel")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            if needs_channel {
+                delivery.insert(
+                    "channel".to_string(),
+                    serde_json::Value::String(channel_name.to_string()),
+                );
+            }
+
+            let needs_target = delivery
+                .get("to")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            if needs_target {
+                delivery.insert(
+                    "to".to_string(),
+                    serde_json::Value::String(reply_target.to_string()),
+                );
+            }
+        }
+        Some(_) => {}
+    }
 }
 
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
@@ -2119,7 +2449,13 @@ async fn execute_one_tool(
     });
     let start = Instant::now();
 
-    let Some(tool) = find_tool(tools_registry, call_name) else {
+    let static_tool = find_tool(tools_registry, call_name);
+    let activated_arc = if static_tool.is_none() {
+        activated_tools.and_then(|at| at.lock().unwrap().get_resolved(call_name))
+    } else {
+        None
+    };
+    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
         observer.record_event(&ObserverEvent::ToolCall {
@@ -2203,6 +2539,14 @@ fn should_execute_tools_in_parallel(
         return false;
     }
 
+    // tool_search activates deferred MCP tools into ActivatedToolSet.
+    // Running tool_search in parallel with the tools it activates causes a
+    // race condition where the tool lookup happens before activation completes.
+    // Force sequential execution whenever tool_search is in the batch.
+    if tool_calls.iter().any(|call| call.name == "tool_search") {
+        return false;
+    }
+
     if let Some(mgr) = approval {
         if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
             // Approval-gated calls must keep sequential handling so the caller can
@@ -2217,6 +2561,7 @@ fn should_execute_tools_in_parallel(
 async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
@@ -2227,6 +2572,7 @@ async fn execute_tools_parallel(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token,
             )
@@ -2240,6 +2586,7 @@ async fn execute_tools_parallel(
 async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
@@ -2251,6 +2598,7 @@ async fn execute_tools_sequential(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token,
             )
@@ -2287,6 +2635,7 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    channel_reply_target: Option<&str>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -2294,6 +2643,9 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    pacing: &crate::config::PacingConfig,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2301,16 +2653,27 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-        .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-        .map(|tool| tool.spec())
-        .collect();
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
-    let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let loop_started_at = Instant::now();
+    let loop_ignore_tools: HashSet<&str> = pacing
+        .loop_ignore_tools
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut consecutive_identical_outputs: usize = 0;
+    let mut last_tool_output_hash: Option<u64> = None;
+
+    let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
+        crate::agent::loop_detector::LoopDetectorConfig {
+            enabled: pacing.loop_detection_enabled,
+            window_size: pacing.loop_detection_window_size,
+            max_repeats: pacing.loop_detection_max_repeats,
+        },
+    );
 
     for iteration in 0..max_iterations {
+        let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+
         if cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -2318,17 +2681,91 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
+        // Check if model switch was requested via model_switch tool
+        if let Some(ref callback) = model_switch_callback {
+            if let Ok(guard) = callback.lock() {
+                if let Some((new_provider, new_model)) = guard.as_ref() {
+                    if new_provider != provider_name || new_model != model {
+                        tracing::info!(
+                            "Model switch detected: {} {} -> {} {}",
+                            provider_name,
+                            model,
+                            new_provider,
+                            new_model
+                        );
+                        return Err(ModelSwitchRequested {
+                            provider: new_provider.clone(),
+                            model: new_model.clone(),
+                        }
+                        .into());
+                    }
+                }
             }
-            .into());
         }
+
+        // Rebuild tool_specs each iteration so newly activated deferred tools appear.
+        let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+            .iter()
+            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+            .map(|tool| tool.spec())
+            .collect();
+        if let Some(at) = activated_tools {
+            for spec in at.lock().unwrap().tool_specs() {
+                if !excluded_tools.iter().any(|ex| ex == &spec.name) {
+                    tool_specs.push(spec);
+                }
+            }
+        }
+        let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+
+        let image_marker_count = multimodal::count_image_markers(history);
+
+        // ── Vision provider routing ──────────────────────────
+        // When the default provider lacks vision support but a dedicated
+        // vision_provider is configured, create it on demand and use it
+        // for this iteration.  Otherwise, preserve the original error.
+        let vision_provider_box: Option<Box<dyn Provider>> = if image_marker_count > 0
+            && !provider.supports_vision()
+        {
+            if let Some(ref vp) = multimodal_config.vision_provider {
+                let vp_instance = providers::create_provider(vp, None)
+                    .map_err(|e| anyhow::anyhow!("failed to create vision provider '{vp}': {e}"))?;
+                if !vp_instance.supports_vision() {
+                    return Err(ProviderCapabilityError {
+                        provider: vp.clone(),
+                        capability: "vision".to_string(),
+                        message: format!(
+                            "configured vision_provider '{vp}' does not support vision input"
+                        ),
+                    }
+                    .into());
+                }
+                Some(vp_instance)
+            } else {
+                return Err(ProviderCapabilityError {
+                        provider: provider_name.to_string(),
+                        capability: "vision".to_string(),
+                        message: format!(
+                            "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                        ),
+                    }
+                    .into());
+            }
+        } else {
+            None
+        };
+
+        let (active_provider, active_provider_name, active_model): (&dyn Provider, &str, &str) =
+            if let Some(ref vp_box) = vision_provider_box {
+                let vp_name = multimodal_config
+                    .vision_provider
+                    .as_deref()
+                    .unwrap_or(provider_name);
+                let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
+                (vp_box.as_ref(), vp_name, vm)
+            } else {
+                (provider, provider_name, model)
+            };
 
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
@@ -2344,15 +2781,15 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
-            provider: provider_name.to_string(),
-            model: model.to_string(),
+            provider: active_provider_name.to_string(),
+            model: active_model.to_string(),
             messages_count: history.len(),
         });
         runtime_trace::record_event(
             "llm_request",
             Some(channel_name),
-            Some(provider_name),
-            Some(model),
+            Some(active_provider_name),
+            Some(active_model),
             Some(&turn_id),
             None,
             None,
@@ -2369,6 +2806,19 @@ pub(crate) async fn run_tool_call_loop(
             hooks.fire_llm_input(history, model).await;
         }
 
+        // Budget enforcement — block if limit exceeded (no-op when not scoped)
+        if let Some(BudgetCheck::Exceeded {
+            current_usd,
+            limit_usd,
+            period,
+        }) = check_tool_loop_budget()
+        {
+            return Err(anyhow::anyhow!(
+                "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
+                current_usd, limit_usd, period
+            ));
+        }
+
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -2377,22 +2827,52 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let chat_future = provider.chat(
+        let chat_future = active_provider.chat(
             ChatRequest {
                 messages: &prepared_messages.messages,
                 tools: request_tools,
             },
-            model,
+            active_model,
             temperature,
         );
 
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
+        // Wrap the LLM call with an optional per-step timeout from pacing config.
+        // This catches a truly hung model response without terminating the overall
+        // task loop (the per-message budget handles that separately).
+        let chat_result = match pacing.step_timeout_secs {
+            Some(step_secs) if step_secs > 0 => {
+                let step_timeout = Duration::from_secs(step_secs);
+                if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = tokio::time::timeout(step_timeout, chat_future) => {
+                            match result {
+                                Ok(inner) => inner,
+                                Err(_) => anyhow::bail!(
+                                    "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                                ),
+                            }
+                        },
+                    }
+                } else {
+                    match tokio::time::timeout(step_timeout, chat_future).await {
+                        Ok(inner) => inner,
+                        Err(_) => anyhow::bail!(
+                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                        ),
+                    }
+                }
             }
-        } else {
-            chat_future.await
+            _ => {
+                if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = chat_future => result,
+                    }
+                } else {
+                    chat_future.await
+                }
+            }
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
@@ -2405,13 +2885,18 @@ pub(crate) async fn run_tool_call_loop(
                         .unwrap_or((None, None));
 
                     observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider: active_provider_name.to_string(),
+                        model: active_model.to_string(),
                         duration: llm_started_at.elapsed(),
                         success: true,
                         error_message: None,
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
+                    });
+
+                    // Record cost via task-local tracker (no-op when not scoped)
+                    let _ = resp.usage.as_ref().and_then(|usage| {
+                        record_tool_loop_cost_usage(active_provider_name, active_model, usage)
                     });
 
                     let response_text = resp.text_or_empty().to_string();
@@ -2435,8 +2920,8 @@ pub(crate) async fn run_tool_call_loop(
                         runtime_trace::record_event(
                             "tool_call_parse_issue",
                             Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
+                            Some(active_provider_name),
+                            Some(active_model),
                             Some(&turn_id),
                             Some(false),
                             Some(&parse_issue),
@@ -2453,8 +2938,8 @@ pub(crate) async fn run_tool_call_loop(
                     runtime_trace::record_event(
                         "llm_response",
                         Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
+                        Some(active_provider_name),
+                        Some(active_model),
                         Some(&turn_id),
                         Some(true),
                         None,
@@ -2503,8 +2988,8 @@ pub(crate) async fn run_tool_call_loop(
                 Err(e) => {
                     let safe_error = crate::providers::sanitize_api_error(&e.to_string());
                     observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider: active_provider_name.to_string(),
+                        model: active_model.to_string(),
                         duration: llm_started_at.elapsed(),
                         success: false,
                         error_message: Some(safe_error.clone()),
@@ -2514,8 +2999,8 @@ pub(crate) async fn run_tool_call_loop(
                     runtime_trace::record_event(
                         "llm_response",
                         Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
+                        Some(active_provider_name),
+                        Some(active_model),
                         Some(&turn_id),
                         Some(false),
                         Some(&safe_error),
@@ -2528,8 +3013,12 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
-        let display_text =
-            resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
         let display_text = strip_tool_result_blocks(&display_text);
 
         // ── Progress: LLM responded ─────────────────────────────
@@ -2590,10 +3079,22 @@ pub(crate) async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Native tool-call providers can return assistant text separately from
+        // the structured call payload; relay it to draft-capable channels.
+        if !display_text.is_empty() {
+            if !native_tool_calls.is_empty() {
+                if let Some(ref tx) = on_delta {
+                    let mut narration = display_text.clone();
+                    if !narration.ends_with('\n') {
+                        narration.push('\n');
+                    }
+                    let _ = tx.send(narration).await;
+                }
+            }
+            if !silent {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -2635,6 +3136,15 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!(
+                                    "\u{274c} {}: {}\n",
+                                    call.name,
+                                    truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
+                                ))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             call.name.clone(),
                             call.tool_call_id.clone(),
@@ -2654,6 +3164,13 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            maybe_inject_channel_delivery_defaults(
+                &tool_name,
+                &mut tool_args,
+                channel_name,
+                channel_reply_target,
+            );
+
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
                 if mgr.needs_approval(&tool_name) {
@@ -2662,11 +3179,13 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
+                    // Interactive CLI: prompt the operator.
+                    // Non-interactive (channels): auto-deny since no operator
+                    // is present to approve.
+                    let decision = if mgr.is_non_interactive() {
+                        ApprovalResponse::No
                     } else {
-                        ApprovalResponse::Yes
+                        mgr.prompt_cli(&request)
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
@@ -2687,6 +3206,11 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!("\u{274c} {}: {}\n", tool_name, denied))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             tool_name.clone(),
                             call.tool_call_id.clone(),
@@ -2723,6 +3247,11 @@ pub(crate) async fn run_tool_call_loop(
                         "deduplicated": true,
                     }),
                 );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!("\u{274c} {}: {}\n", tool_name, duplicate))
+                        .await;
+                }
                 ordered_results[idx] = Some((
                     tool_name.clone(),
                     call.tool_call_id.clone(),
@@ -2775,6 +3304,7 @@ pub(crate) async fn run_tool_call_loop(
             execute_tools_parallel(
                 &executable_calls,
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token.as_ref(),
             )
@@ -2783,6 +3313,7 @@ pub(crate) async fn run_tool_call_loop(
             execute_tools_sequential(
                 &executable_calls,
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token.as_ref(),
             )
@@ -2825,25 +3356,129 @@ pub(crate) async fn run_tool_call_loop(
             // ── Progress: tool completion ───────────────────────
             if let Some(ref tx) = on_delta {
                 let secs = outcome.duration.as_secs();
-                let icon = if outcome.success {
-                    "\u{2705}"
+                let progress_msg = if outcome.success {
+                    format!("\u{2705} {} ({secs}s)\n", call.name)
+                } else if let Some(ref reason) = outcome.error_reason {
+                    format!(
+                        "\u{274c} {} ({secs}s): {}\n",
+                        call.name,
+                        truncate_with_ellipsis(reason, 200)
+                    )
                 } else {
-                    "\u{274c}"
+                    format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+                let _ = tx.send(progress_msg).await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+        // Collect tool results and build per-tool output for loop detection.
+        // Only non-ignored tool outputs contribute to the identical-output hash.
+        let mut detection_relevant_output = String::new();
+        // Use enumerate *before* filter_map so result_index stays aligned with
+        // tool_calls even when some ordered_results entries are None.
+        for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, opt)| opt.map(|v| (i, v)))
+        {
+            if !loop_ignore_tools.contains(tool_name.as_str()) {
+                detection_relevant_output.push_str(&outcome.output);
+
+                // Feed the pattern-based loop detector with name + args + result.
+                let args = tool_calls
+                    .get(result_index)
+                    .map(|c| &c.arguments)
+                    .unwrap_or(&serde_json::Value::Null);
+                let det_result = loop_detector.record(&tool_name, args, &outcome.output);
+                match det_result {
+                    crate::agent::loop_detector::LoopDetectionResult::Ok => {}
+                    crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
+                        tracing::warn!(tool = %tool_name, %msg, "loop detector warning");
+                        // Inject a system nudge so the LLM adjusts strategy.
+                        history.push(ChatMessage::system(format!("[Loop Detection] {msg}")));
+                    }
+                    crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
+                        tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
+                        // Replace the tool output with the block message.
+                        // We still continue the loop so the LLM sees the block feedback.
+                        history.push(ChatMessage::system(format!(
+                            "[Loop Detection — BLOCKED] {msg}"
+                        )));
+                    }
+                    crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
+                        runtime_trace::record_event(
+                            "loop_detector_circuit_breaker",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some(&msg),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": tool_name,
+                            }),
+                        );
+                        anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    }
+                }
+            }
             individual_results.push((tool_call_id, outcome.output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
                 tool_name, outcome.output
             );
+        }
+
+        // ── Time-gated loop detection ──────────────────────────
+        // When pacing.loop_detection_min_elapsed_secs is set, identical-output
+        // loop detection activates after the task has been running that long.
+        // This avoids false-positive aborts on long-running browser/research
+        // workflows while keeping aggressive protection for quick tasks.
+        // When not configured, identical-output detection is disabled (preserving
+        // existing behavior where only max_iterations prevents runaway loops).
+        let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
+            Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
+            None => false, // disabled when not configured (backwards compatible)
+        };
+
+        if loop_detection_active && !detection_relevant_output.is_empty() {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            detection_relevant_output.hash(&mut hasher);
+            let current_hash = hasher.finish();
+
+            if last_tool_output_hash == Some(current_hash) {
+                consecutive_identical_outputs += 1;
+            } else {
+                consecutive_identical_outputs = 0;
+                last_tool_output_hash = Some(current_hash);
+            }
+
+            // Bail if we see 3+ consecutive identical tool outputs (clear runaway).
+            if consecutive_identical_outputs >= 3 {
+                runtime_trace::record_event(
+                    "tool_loop_identical_output_abort",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("identical tool output detected 3 consecutive times"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "consecutive_identical": consecutive_identical_outputs,
+                    }),
+                );
+                anyhow::bail!(
+                    "Agent loop aborted: identical tool output detected {} consecutive times",
+                    consecutive_identical_outputs
+                );
+            }
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -2898,7 +3533,10 @@ pub(crate) async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+pub(crate) fn build_tool_instructions(
+    tools_registry: &[Box<dyn Tool>],
+    tool_descriptions: Option<&ToolDescriptions>,
+) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -2914,11 +3552,14 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
+        let desc = tool_descriptions
+            .and_then(|td| td.get(tool.name()))
+            .unwrap_or_else(|| tool.description());
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
             tool.name(),
-            tool.description(),
+            desc,
             tool.parameters_schema()
         );
     }
@@ -2942,6 +3583,7 @@ pub async fn run(
     peripheral_overrides: Vec<String>,
     interactive: bool,
     session_state_file: Option<PathBuf>,
+    allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2980,7 +3622,13 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle) = tools::all_tools_with_runtime(
+    let (
+        mut tools_registry,
+        delegate_handle,
+        _reaction_handle,
+        _channel_map_handle,
+        _ask_user_handle,
+    ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2994,6 +3642,7 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -3001,6 +3650,19 @@ pub async fn run(
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
+    }
+
+    // ── Capability-based tool access control ─────────────────────
+    // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
+    // those tools whose name appears in the list. Unknown names are silently
+    // ignored. When `None`, all tools remain available (backward compatible).
+    if let Some(ref allow_list) = allowed_tools {
+        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        tracing::info!(
+            allowed = allow_list.len(),
+            retained = tools_registry.len(),
+            "Applied capability-based tool access filter"
+        );
     }
 
     // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
@@ -3014,6 +3676,9 @@ pub async fn run(
     // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
     // fetch schemas on demand. This reduces context window waste.
     let mut deferred_section = String::new();
+    let mut activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -3038,6 +3703,7 @@ pub async fn run(
                     let activated = std::sync::Arc::new(std::sync::Mutex::new(
                         crate::tools::ActivatedToolSet::new(),
                     ));
+                    activated_handle = Some(std::sync::Arc::clone(&activated));
                     tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
@@ -3075,36 +3741,31 @@ pub async fn run(
     }
 
     // ── Resolve provider ─────────────────────────────────────────
-    let provider_name = provider_override
+    let mut provider_name = provider_override
         .as_deref()
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+        .unwrap_or("openrouter")
+        .to_string();
 
-    let model_name = model_override
+    let mut model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .unwrap_or("anthropic/claude-sonnet-4")
+        .to_string();
 
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        provider_timeout_secs: Some(config.provider_timeout_secs),
-        extra_headers: config.extra_headers.clone(),
-        api_path: config.api_path.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
+    let mut provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+        &provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
-        model_name,
+        &model_name,
         &provider_runtime_options,
     )?;
+
+    let model_switch_callback = get_model_switch_state();
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -3131,8 +3792,23 @@ pub async fn run(
         .map(|b| b.board.clone())
         .collect();
 
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // Register skill-defined tools as callable tool specs in the tool registry
+    // so the LLM can invoke them via native function calling, not just XML prompts.
+    tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -3159,6 +3835,15 @@ pub async fn run(
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
         ),
     ];
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) {
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+        ));
+    }
     tool_descs.push((
         "cron_add",
         "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
@@ -3247,20 +3932,23 @@ pub async fn run(
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
-        model_name,
+        &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.compact_context,
+        config.agent.max_system_prompt_chars,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -3276,35 +3964,79 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
+    let memory_session_id = session_state_file
+        .as_deref()
+        .and_then(memory_session_id_from_state_file);
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
     let mut final_output = String::new();
 
+    // Save the base system prompt before any thinking modifications so
+    // the interactive loop can restore it between turns.
+    let base_system_prompt = system_prompt.clone();
+
     if let Some(msg) = message {
+        // ── Parse thinking directive from user message ─────────
+        let (thinking_directive, effective_msg) =
+            match crate::agent::thinking::parse_thinking_directive(&msg) {
+                Some((level, remaining)) => {
+                    tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+                    (Some(level), remaining)
+                }
+                None => (None, msg.clone()),
+            };
+        let thinking_level = crate::agent::thinking::resolve_thinking_level(
+            thinking_directive,
+            None,
+            &config.agent.thinking,
+        );
+        let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+        let effective_temperature = crate::agent::thinking::clamp_temperature(
+            temperature + thinking_params.temperature_adjustment,
+        );
+
+        // Prepend thinking system prompt prefix when present.
+        if let Some(ref prefix) = thinking_params.system_prompt_prefix {
+            system_prompt = format!("{prefix}\n\n{system_prompt}");
+        }
+
         // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        if config.memory.auto_save
+            && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && !memory::should_skip_autosave_content(&effective_msg)
+        {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
+                .store(
+                    &user_key,
+                    &effective_msg,
+                    MemoryCategory::Conversation,
+                    memory_session_id.as_deref(),
+                )
                 .await;
         }
 
         // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        let mem_context = build_context(
+            mem.as_ref(),
+            &effective_msg,
+            config.memory.min_relevance_score,
+            memory_session_id.as_deref(),
+        )
+        .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
-            .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
+            .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
             .unwrap_or_default();
         let context = format!("{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
-            format!("[{now}] {msg}")
+            format!("[{now}] {effective_msg}")
         } else {
-            format!("{context}[{now}] {msg}")
+            format!("{context}[{now}] {effective_msg}")
         };
 
         let mut history = vec![
@@ -3312,30 +4044,110 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        // Compute per-turn excluded MCP tools from tool_filter_groups.
-        let excluded_tools =
-            compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
+        // Prune history for token efficiency (when enabled).
+        if config.agent.history_pruning.enabled {
+            let _stats = crate::agent::history_pruner::prune_history(
+                &mut history,
+                &config.agent.history_pruning,
+            );
+        }
 
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
+        // Compute per-turn excluded MCP tools from tool_filter_groups.
+        let excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            false,
-            approval_manager.as_ref(),
-            channel_name,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            None,
-            None,
-            &excluded_tools,
-            &config.agent.tool_call_dedup_exempt,
-        )
-        .await?;
+            &config.agent.tool_filter_groups,
+            &effective_msg,
+        );
+
+        #[allow(unused_assignments)]
+        let mut response = String::new();
+        loop {
+            match run_tool_call_loop(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                &provider_name,
+                &model_name,
+                effective_temperature,
+                false,
+                approval_manager.as_ref(),
+                channel_name,
+                None,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                None,
+                None,
+                None,
+                &excluded_tools,
+                &config.agent.tool_call_dedup_exempt,
+                activated_handle.as_ref(),
+                Some(model_switch_callback.clone()),
+                &config.pacing,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    response = resp;
+                    break;
+                }
+                Err(e) => {
+                    if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                        tracing::info!(
+                            "Model switch requested, switching from {} {} to {} {}",
+                            provider_name,
+                            model_name,
+                            new_provider,
+                            new_model
+                        );
+
+                        provider = providers::create_routed_provider_with_options(
+                            &new_provider,
+                            config.api_key.as_deref(),
+                            config.api_url.as_deref(),
+                            &config.reliability,
+                            &config.model_routes,
+                            &new_model,
+                            &provider_runtime_options,
+                        )?;
+
+                        provider_name = new_provider;
+                        model_name = new_model;
+
+                        clear_model_switch_request();
+
+                        observer.record_event(&ObserverEvent::AgentStart {
+                            provider: provider_name.to_string(),
+                            model: model_name.to_string(),
+                        });
+
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // After successful multi-step execution, attempt autonomous skill creation.
+        #[cfg(feature = "skill-creation")]
+        if config.skills.skill_creation.enabled {
+            let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
+            if tool_calls.len() >= 2 {
+                let creator = crate::skills::creator::SkillCreator::new(
+                    config.workspace_dir.clone(),
+                    config.skills.skill_creation.clone(),
+                );
+                match creator.create_from_execution(&msg, &tool_calls, None).await {
+                    Ok(Some(slug)) => {
+                        tracing::info!(slug, "Auto-created skill from execution");
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                    }
+                    Err(e) => tracing::warn!("Skill creation failed: {e}"),
+                }
+            }
+        }
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -3377,9 +4189,10 @@ pub async fn run(
                 "/quit" | "/exit" => break,
                 "/help" => {
                     println!("Available commands:");
-                    println!("  /help        Show this help message");
-                    println!("  /clear /new  Clear conversation history");
-                    println!("  /quit /exit  Exit interactive mode\n");
+                    println!("  /help             Show this help message");
+                    println!("  /clear /new       Clear conversation history");
+                    println!("  /quit /exit       Exit interactive mode");
+                    println!("  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n");
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -3431,28 +4244,72 @@ pub async fn run(
                 _ => {}
             }
 
+            // ── Parse thinking directive from interactive input ───
+            let (thinking_directive, effective_input) =
+                match crate::agent::thinking::parse_thinking_directive(&user_input) {
+                    Some((level, remaining)) => {
+                        tracing::info!(thinking_level = ?level, "Thinking directive parsed");
+                        (Some(level), remaining)
+                    }
+                    None => (None, user_input.clone()),
+                };
+            let thinking_level = crate::agent::thinking::resolve_thinking_level(
+                thinking_directive,
+                None,
+                &config.agent.thinking,
+            );
+            let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+            let turn_temperature = crate::agent::thinking::clamp_temperature(
+                temperature + thinking_params.temperature_adjustment,
+            );
+
+            // For non-Medium levels, temporarily patch the system prompt with prefix.
+            let turn_system_prompt;
+            if let Some(ref prefix) = thinking_params.system_prompt_prefix {
+                turn_system_prompt = format!("{prefix}\n\n{system_prompt}");
+                // Update the system message in history for this turn.
+                if let Some(sys_msg) = history.first_mut() {
+                    if sys_msg.role == "system" {
+                        sys_msg.content = turn_system_prompt.clone();
+                    }
+                }
+            }
+
             // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            if config.memory.auto_save
+                && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                && !memory::should_skip_autosave_content(&effective_input)
+            {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
+                    .store(
+                        &user_key,
+                        &effective_input,
+                        MemoryCategory::Conversation,
+                        memory_session_id.as_deref(),
+                    )
                     .await;
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context(
+                mem.as_ref(),
+                &effective_input,
+                config.memory.min_relevance_score,
+                memory_session_id.as_deref(),
+            )
+            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
-                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
+                .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
             let enriched = if context.is_empty() {
-                format!("[{now}] {user_input}")
+                format!("[{now}] {effective_input}")
             } else {
-                format!("{context}[{now}] {user_input}")
+                format!("{context}[{now}] {effective_input}")
             };
 
             history.push(ChatMessage::user(&enriched));
@@ -3461,34 +4318,71 @@ pub async fn run(
             let excluded_tools = compute_excluded_mcp_tools(
                 &tools_registry,
                 &config.agent.tool_filter_groups,
-                &user_input,
+                &effective_input,
             );
 
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &excluded_tools,
-                &config.agent.tool_call_dedup_exempt,
-            )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
+            let response = loop {
+                match run_tool_call_loop(
+                    provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    &provider_name,
+                    &model_name,
+                    turn_temperature,
+                    false,
+                    approval_manager.as_ref(),
+                    channel_name,
+                    None,
+                    &config.multimodal,
+                    config.agent.max_tool_iterations,
+                    None,
+                    None,
+                    None,
+                    &excluded_tools,
+                    &config.agent.tool_call_dedup_exempt,
+                    activated_handle.as_ref(),
+                    Some(model_switch_callback.clone()),
+                    &config.pacing,
+                )
+                .await
+                {
+                    Ok(resp) => break resp,
+                    Err(e) => {
+                        if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                            tracing::info!(
+                                "Model switch requested, switching from {} {} to {} {}",
+                                provider_name,
+                                model_name,
+                                new_provider,
+                                new_model
+                            );
+
+                            provider = providers::create_routed_provider_with_options(
+                                &new_provider,
+                                config.api_key.as_deref(),
+                                config.api_url.as_deref(),
+                                &config.reliability,
+                                &config.model_routes,
+                                &new_model,
+                                &provider_runtime_options,
+                            )?;
+
+                            provider_name = new_provider;
+                            model_name = new_model;
+
+                            clear_model_switch_request();
+
+                            observer.record_event(&ObserverEvent::AgentStart {
+                                provider: provider_name.to_string(),
+                                model: model_name.to_string(),
+                            });
+
+                            continue;
+                        }
+                        eprintln!("\nError: {e}\n");
+                        break String::new();
+                    }
                 }
             };
             final_output = response.clone();
@@ -3506,8 +4400,9 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
-                model_name,
+                &model_name,
                 config.agent.max_history_messages,
+                config.agent.max_context_tokens,
             )
             .await
             {
@@ -3518,6 +4413,15 @@ pub async fn run(
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
+
+            // Restore base system prompt (remove per-turn thinking prefix).
+            if thinking_params.system_prompt_prefix.is_some() {
+                if let Some(sys_msg) = history.first_mut() {
+                    if sys_msg.role == "system" {
+                        sys_msg.content.clone_from(&base_system_prompt);
+                    }
+                }
+            }
 
             if let Some(path) = session_state_file.as_deref() {
                 save_interactive_session_history(path, &history)?;
@@ -3539,7 +4443,11 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
+pub async fn process_message(
+    config: Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3548,6 +4456,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.autonomy,
         &config.workspace_dir,
     ));
+    let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
@@ -3564,7 +4473,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle_pm) = tools::all_tools_with_runtime(
+    let (
+        mut tools_registry,
+        delegate_handle_pm,
+        _reaction_handle_pm,
+        _channel_map_handle_pm,
+        _ask_user_handle_pm,
+    ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3578,6 +4493,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
@@ -3587,6 +4503,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     // NOTE: Same ordering contract as the CLI path above — MCP tools must be
     // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
     // tool allow/deny filtering) to avoid MCP tools being silently dropped.
+    let mut deferred_section = String::new();
+    let mut activated_handle_pm: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -3595,28 +4515,50 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
-                let names = registry.tool_names();
-                let mut registered = 0usize;
-                for name in names {
-                    if let Some(def) = registry.get_tool_def(&name).await {
-                        let wrapper: std::sync::Arc<dyn Tool> =
-                            std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                name,
-                                def,
-                                std::sync::Arc::clone(&registry),
-                            ));
-                        if let Some(ref handle) = delegate_handle_pm {
-                            handle.write().push(std::sync::Arc::clone(&wrapper));
+                if config.mcp.deferred_loading {
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle_pm = Some(std::sync::Arc::clone(&activated));
+                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle_pm {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
                         }
-                        tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                        registered += 1;
                     }
+                    tracing::info!(
+                        "MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
                 }
-                tracing::info!(
-                    "MCP: {} tool(s) registered from {} server(s)",
-                    registered,
-                    registry.server_count()
-                );
             }
             Err(e) => {
                 tracing::error!("MCP registry failed to initialize: {e:#}");
@@ -3629,16 +4571,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        provider_timeout_secs: Some(config.provider_timeout_secs),
-        extra_headers: config.extra_headers.clone(),
-        api_path: config.api_path.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
@@ -3664,7 +4597,21 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .map(|b| b.board.clone())
         .collect();
 
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // Register skill-defined tools as callable tool specs (process_message path).
+    tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
@@ -3679,6 +4626,15 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) {
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        ));
+    }
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
     }
@@ -3712,44 +4668,100 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+
+    // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
+    // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
+    if config.autonomy.level != AutonomyLevel::Full {
+        let excluded = &config.autonomy.non_cli_excluded_tools;
+        if !excluded.is_empty() {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
+    }
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.compact_context,
+        config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+    }
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
     }
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    // ── Parse thinking directive from user message ─────────────
+    let (thinking_directive, effective_message) =
+        match crate::agent::thinking::parse_thinking_directive(message) {
+            Some((level, remaining)) => {
+                tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+                (Some(level), remaining)
+            }
+            None => (None, message.to_string()),
+        };
+    let thinking_level = crate::agent::thinking::resolve_thinking_level(
+        thinking_directive,
+        None,
+        &config.agent.thinking,
+    );
+    let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+    let effective_temperature = crate::agent::thinking::clamp_temperature(
+        config.default_temperature + thinking_params.temperature_adjustment,
+    );
+
+    // Prepend thinking system prompt prefix when present.
+    if let Some(ref prefix) = thinking_params.system_prompt_prefix {
+        system_prompt = format!("{prefix}\n\n{system_prompt}");
+    }
+
+    let effective_msg_ref = effective_message.as_str();
+    let mem_context = build_context(
+        mem.as_ref(),
+        effective_msg_ref,
+        config.memory.min_relevance_score,
+        session_id,
+    )
+    .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
+        .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
         .unwrap_or_default();
     let context = format!("{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let enriched = if context.is_empty() {
-        format!("[{now}] {message}")
+        format!("[{now}] {effective_message}")
     } else {
-        format!("{context}[{now}] {message}")
+        format!("{context}[{now}] {effective_message}")
     };
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
+    let mut excluded_tools = compute_excluded_mcp_tools(
+        &tools_registry,
+        &config.agent.tool_filter_groups,
+        effective_msg_ref,
+    );
+    if config.autonomy.level != AutonomyLevel::Full {
+        excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
+    }
 
     agent_turn(
         provider.as_ref(),
@@ -3758,10 +4770,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         observer.as_ref(),
         provider_name,
         &model_name,
-        config.default_temperature,
+        effective_temperature,
         true,
+        "daemon",
+        None,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        Some(&approval_manager),
+        &excluded_tools,
+        &config.agent.tool_call_dedup_exempt,
+        activated_handle_pm.as_ref(),
+        None,
     )
     .await
 }
@@ -3821,7 +4840,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_scrub_credentials() {
+    fn scrub_credentials_redacts_bearer_token() {
         let input = "API_KEY=sk-1234567890abcdef; token: 1234567890; password=\"secret123456\"";
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("API_KEY=sk-1*[REDACTED]"));
@@ -3832,7 +4851,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_credentials_json() {
+    fn scrub_credentials_redacts_json_api_key() {
         let input = r#"{"api_key": "sk-1234567890", "other": "public"}"#;
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
@@ -3850,12 +4869,43 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result = execute_one_tool("unknown_tool", call_arguments, &[], &observer, None).await;
+        let result =
+            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
         assert!(!outcome.success);
         assert!(outcome.output.contains("Unknown tool: unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_resolves_unique_activated_tool_suffix() {
+        let observer = NoopObserver;
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        let outcome = execute_one_tool(
+            "extract_text",
+            serde_json::json!({ "value": "ok" }),
+            &[],
+            Some(&activated),
+            &observer,
+            None,
+        )
+        .await
+        .expect("suffix alias should execute the unique activated tool");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "counted:ok");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
@@ -3892,6 +4942,7 @@ mod tests {
             ProviderCapabilities {
                 native_tool_calling: false,
                 vision: true,
+                prompt_caching: false,
             }
         }
 
@@ -4041,6 +5092,57 @@ mod tests {
         }
     }
 
+    struct RecordingArgsTool {
+        name: String,
+        recorded_args: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl RecordingArgsTool {
+        fn new(name: &str, recorded_args: Arc<Mutex<Vec<serde_json::Value>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                recorded_args,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RecordingArgsTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Records tool arguments for regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "schedule": { "type": "object" },
+                    "delivery": { "type": "object" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.recorded_args
+                .lock()
+                .expect("recorded args lock should be valid")
+                .push(args.clone());
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: args.to_string(),
+                error: None,
+            })
+        }
+    }
+
     struct DelayTool {
         name: String,
         delay_ms: u64,
@@ -4109,6 +5211,52 @@ mod tests {
         }
     }
 
+    /// A tool that always returns a failure with a given error reason.
+    struct FailingTool {
+        tool_name: String,
+        error_reason: String,
+    }
+
+    impl FailingTool {
+        fn new(name: &str, error_reason: &str) -> Self {
+            Self {
+                tool_name: name.to_string(),
+                error_reason: error_reason.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "A tool that always fails for testing failure surfacing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.error_reason.clone()),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4133,6 +5281,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -4140,6 +5289,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4167,6 +5319,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let err = run_tool_call_loop(
@@ -4180,6 +5333,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &multimodal,
             3,
             None,
@@ -4187,6 +5341,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4221,6 +5378,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -4228,12 +5386,322 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("valid multimodal payload should pass");
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// When `vision_provider` is not set and the default provider lacks vision
+    /// support, the original `ProviderCapabilityError` should be returned.
+    #[tokio::test]
+    async fn run_tool_call_loop_no_vision_provider_config_preserves_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "check [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should fail without vision_provider config");
+
+        assert!(err.to_string().contains("capability=vision"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// When `vision_provider` is set but the provider factory cannot resolve
+    /// the name, a descriptive error should be returned (not the generic
+    /// capability error).
+    #[tokio::test]
+    async fn run_tool_call_loop_vision_provider_creation_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: Some("some-model".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should fail when vision provider cannot be created");
+
+        assert!(
+            err.to_string().contains("failed to create vision provider"),
+            "expected creation failure error, got: {}",
+            err
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Messages without image markers should use the default provider even
+    /// when `vision_provider` is configured.
+    #[tokio::test]
+    async fn run_tool_call_loop_no_images_uses_default_provider() {
+        let provider = ScriptedProvider::from_text_responses(vec!["hello world"]);
+
+        let mut history = vec![ChatMessage::user("just text, no images".to_string())];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: Some("some-model".to_string()),
+            ..Default::default()
+        };
+
+        // Even though vision_provider points to a nonexistent provider, this
+        // should succeed because there are no image markers to trigger routing.
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "scripted",
+            "scripted-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("text-only messages should succeed with default provider");
+
+        assert_eq!(result, "hello world");
+    }
+
+    /// When `vision_provider` is set but `vision_model` is not, the default
+    /// model should be used as fallback for the vision provider.
+    #[tokio::test]
+    async fn run_tool_call_loop_vision_provider_without_model_falls_back() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        // vision_provider set but vision_model is None — the code should
+        // fall back to the default model. Since the provider name is invalid,
+        // we just verify the error path references the correct provider.
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: None,
+            ..Default::default()
+        };
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should fail due to nonexistent vision provider");
+
+        // Verify the routing was attempted (not the generic capability error).
+        assert!(
+            err.to_string().contains("failed to create vision provider"),
+            "expected creation failure, got: {}",
+            err
+        );
+    }
+
+    /// Empty `[IMAGE:]` markers (which are preserved as literal text by the
+    /// parser) should not trigger vision provider routing.
+    #[tokio::test]
+    async fn run_tool_call_loop_empty_image_markers_use_default_provider() {
+        let provider = ScriptedProvider::from_text_responses(vec!["handled"]);
+
+        let mut history = vec![ChatMessage::user(
+            "empty marker [IMAGE:] should be ignored".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            ..Default::default()
+        };
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "scripted",
+            "scripted-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("empty image markers should not trigger vision routing");
+
+        assert_eq!(result, "handled");
+    }
+
+    /// Multiple image markers should still trigger vision routing when
+    /// vision_provider is configured.
+    #[tokio::test]
+    async fn run_tool_call_loop_multiple_images_trigger_vision_routing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "two images [IMAGE:data:image/png;base64,aQ==] and [IMAGE:data:image/png;base64,bQ==]"
+                .to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: Some("llava:7b".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should attempt vision provider creation for multiple images");
+
+        assert!(
+            err.to_string().contains("failed to create vision provider"),
+            "expected creation failure for multiple images, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -4348,6 +5816,7 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4355,6 +5824,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("parallel execution should complete");
@@ -4381,6 +5853,124 @@ mod tests {
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"remind me later","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            Some("chat-42"),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("cron_add delivery defaults should be injected");
+
+        assert_eq!(result, "done");
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "telegram",
+                "to": "chat-42",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_explicit_cron_delivery_none() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"run silently","schedule":{"kind":"every","every_ms":60000},"delivery":{"mode":"none"}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a quiet cron job"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            Some("chat-42"),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("explicit delivery mode should be preserved");
+
+        assert_eq!(result, "done");
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        assert_eq!(recorded[0]["delivery"], serde_json::json!({"mode": "none"}));
     }
 
     #[tokio::test]
@@ -4418,6 +6008,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4425,6 +6016,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4442,6 +6036,71 @@ mod tests {
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_low_risk_shell_in_non_interactive_mode() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hello"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let tmp = TempDir::new().expect("temp dir");
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn crate::runtime::RuntimeAdapter> =
+            Arc::new(crate::runtime::NativeRuntime::new());
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            crate::tools::shell::ShellTool::new(security, runtime),
+        )];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+        let approval_mgr =
+            ApprovalManager::for_non_interactive(&crate::config::AutonomyConfig::default());
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("non-interactive shell should succeed for low-risk command");
+
+        assert_eq!(result, "done");
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        assert!(tool_results.content.contains("hello"));
+        assert!(!tool_results.content.contains("Denied by user."));
     }
 
     #[tokio::test]
@@ -4480,6 +6139,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4487,6 +6147,9 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4557,6 +6220,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4564,6 +6228,9 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("loop should complete");
@@ -4611,6 +6278,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4618,6 +6286,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("native fallback id flow should complete");
@@ -4638,12 +6309,167 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: Some("Task started. Waiting 30 seconds before checking status.".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_wait".into(),
+                        name: "count_tool".into(),
+                        arguments: r#"{"value":"A"}"#.into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Final answer".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("native tool-call text should be relayed through on_delta");
+
+        let mut deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            deltas.push(delta);
+        }
+
+        let explanation_idx = deltas
+            .iter()
+            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.\n")
+            .expect("native assistant text should be relayed to on_delta");
+        let clear_idx = deltas
+            .iter()
+            .position(|delta| delta == DRAFT_CLEAR_SENTINEL)
+            .expect("final answer streaming should clear prior draft state");
+
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| delta.starts_with("\u{1f4ac} Got 1 tool call(s)")),
+            "tool-call progress line should still be relayed"
+        );
+        assert!(
+            explanation_idx < clear_idx,
+            "native assistant text should arrive before final-answer draft clearing"
+        );
+        assert_eq!(result, "Final answer");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn agent_turn_executes_activated_tool_from_wrapper() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"pixel__get_api_health","arguments":{"value":"ok"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+            let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+                "pixel__get_api_health",
+                Arc::clone(&invocations),
+            ));
+            activated
+                .lock()
+                .unwrap()
+                .activate("pixel__get_api_health".into(), activated_tool);
+
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("use the activated MCP tool"),
+            ];
+            let observer = NoopObserver;
+
+            let result = agent_turn(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                "daemon",
+                None,
+                &crate::config::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                Some(&activated),
+                None,
+            )
+            .await
+            .expect("wrapper path should execute activated tools");
+
+            assert_eq!(result, "done");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        });
+    }
+
     #[test]
     fn resolve_display_text_hides_raw_payload_for_tool_only_turns() {
         let display = resolve_display_text(
             "<tool_call>{\"name\":\"memory_store\"}</tool_call>",
             "",
             true,
+            false,
         );
         assert!(display.is_empty());
     }
@@ -4654,13 +6480,20 @@ mod tests {
             "<tool_call>{\"name\":\"shell\"}</tool_call>",
             "Let me check that.",
             true,
+            false,
         );
         assert_eq!(display, "Let me check that.");
     }
 
     #[test]
+    fn resolve_display_text_uses_response_text_for_native_tool_turns() {
+        let display = resolve_display_text("Task started.", "", true, true);
+        assert_eq!(display, "Task started.");
+    }
+
+    #[test]
     fn resolve_display_text_uses_response_text_for_final_turns() {
-        let display = resolve_display_text("Final answer", "", false);
+        let display = resolve_display_text("Final answer", "", false, false);
         assert_eq!(display, "Final answer");
     }
 
@@ -5207,7 +7040,7 @@ Tail"#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools);
+        let instructions = build_tool_instructions(&tools, None);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
@@ -5333,7 +7166,7 @@ Tail"#;
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5, None).await.unwrap();
+        let recalled = mem.recall("45", 5, None, None, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
@@ -5358,7 +7191,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0).await;
+        let context = build_context(&mem, "status updates", 0.0, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -5784,12 +7617,15 @@ Final answer."#;
     }
 
     #[test]
-    fn parse_glm_style_plain_url() {
+    fn parse_glm_style_ignores_plain_url() {
+        // A bare URL should NOT be interpreted as a tool call — this was
+        // causing false positives when LLMs included URLs in normal text.
         let response = "https://example.com/api";
         let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(
+            calls.is_empty(),
+            "plain URL must not be parsed as tool call"
+        );
     }
 
     #[test]
@@ -6064,6 +7900,7 @@ Let me check the result."#;
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
         );
 
         // Must contain zero XML protocol artifacts
@@ -6395,6 +8232,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Always,
             tools: vec!["mcp_filesystem_*".into()],
             keywords: vec![],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "anything");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -6413,6 +8251,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -6429,6 +8268,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -6445,8 +8285,368 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["Browse".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
         assert_eq!(result.len(), 1);
+    }
+
+    // ── Token-based compaction tests ──────────────────────────
+
+    #[test]
+    fn estimate_history_tokens_empty() {
+        assert_eq!(super::estimate_history_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_history_tokens_single_message() {
+        let history = vec![ChatMessage::user("hello world")]; // 11 chars
+        let tokens = super::estimate_history_tokens(&history);
+        // 11.div_ceil(4) + 4 = 3 + 4 = 7
+        assert_eq!(tokens, 7);
+    }
+
+    #[test]
+    fn estimate_history_tokens_multiple_messages() {
+        let history = vec![
+            ChatMessage::system("You are helpful."), // 16 chars → 4 + 4 = 8
+            ChatMessage::user("What is Rust?"),      // 13 chars → 4 + 4 = 8
+            ChatMessage::assistant("A language."),   // 11 chars → 3 + 4 = 7
+        ];
+        let tokens = super::estimate_history_tokens(&history);
+        assert_eq!(tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"failing_shell","arguments":{"command":"rm -rf /"}}
+</tool_call>"#,
+            "I could not execute that command.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+            "failing_shell",
+            "Command not allowed by security policy: rm -rf /",
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("delete everything"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("tool loop should complete");
+
+        // Collect all messages sent to the on_delta channel.
+        let mut deltas = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            deltas.push(msg);
+        }
+
+        let all_deltas = deltas.join("");
+
+        // The failure reason should appear in the progress messages.
+        assert!(
+            all_deltas.contains("Command not allowed by security policy"),
+            "on_delta messages should include the tool failure reason, got: {all_deltas}"
+        );
+
+        // Should also contain the cross mark (❌) icon to indicate failure.
+        assert!(
+            all_deltas.contains('\u{274c}'),
+            "on_delta messages should include ❌ for failed tool calls, got: {all_deltas}"
+        );
+
+        assert_eq!(result, "I could not execute that command.");
+    }
+
+    // ── filter_by_allowed_tools tests ─────────────────────────────────────
+
+    #[test]
+    fn filter_by_allowed_tools_none_passes_all() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let result = filter_by_allowed_tools(specs, None);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_some_restricts_to_listed() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let allowed = vec!["shell".to_string(), "memory_store".to_string()];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"memory_store"));
+        assert!(!names.contains(&"file_read"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_unknown_names_silently_ignored() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed = vec![
+            "shell".to_string(),
+            "nonexistent_tool".to_string(),
+            "another_missing".to_string(),
+        ];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains(&"shell"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_empty_list_excludes_all() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed: Vec<String> = vec![];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        assert!(result.is_empty());
+    }
+
+    // ── Cost tracking tests ──
+
+    #[tokio::test]
+    async fn cost_tracking_records_usage_when_scoped() {
+        use super::{
+            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+        };
+        use crate::config::schema::ModelPricing;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut cost_config = crate::config::CostConfig {
+            enabled: true,
+            ..crate::config::CostConfig::default()
+        };
+        cost_config.prices = HashMap::from([(
+            "mock-model".to_string(),
+            ModelPricing {
+                input: 3.0,
+                output: 15.0,
+            },
+        )]);
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(cost_config.prices.clone()),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &crate::config::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    &crate::config::PacingConfig::default(),
+                ),
+            )
+            .await
+            .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_200);
+        assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_enforces_budget() {
+        use super::{
+            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+        };
+        use crate::config::schema::ModelPricing;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+
+        let provider = ScriptedProvider::from_text_responses(vec!["should not reach this"]);
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = crate::config::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..crate::config::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        // Record a usage that already exceeds the limit
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                1.0,
+                1.0,
+            ))
+            .unwrap();
+
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "mock-model".to_string(),
+                ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                },
+            )])),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let err = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &crate::config::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    &crate::config::PacingConfig::default(),
+                ),
+            )
+            .await
+            .expect_err("should fail with budget exceeded");
+
+        assert!(
+            err.to_string().contains("Budget exceeded"),
+            "error should mention budget: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_is_noop_without_scope() {
+        use super::run_tool_call_loop;
+        use crate::observability::noop::NoopObserver;
+
+        // No TOOL_LOOP_COST_TRACKING_CONTEXT scoped — should run fine
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("should succeed without cost scope");
+
+        assert_eq!(result, "ok");
     }
 }

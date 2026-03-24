@@ -1,20 +1,35 @@
+pub mod audit;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+pub mod conflict;
+pub mod consolidation;
+pub mod decay;
 pub mod embeddings;
 pub mod hygiene;
+pub mod importance;
+pub mod knowledge_graph;
+#[cfg(feature = "memory-postgres")]
+pub mod knowledge_graph_pg;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+pub mod policy;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
+pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
 pub mod vector;
 
+#[cfg(test)]
+mod battle_tests;
+
+#[allow(unused_imports)]
+pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
@@ -23,14 +38,18 @@ pub use backend::{
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
+#[allow(unused_imports)]
+pub use policy::PolicyEnforcer;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
+#[allow(unused_imports)]
+pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry};
+pub use traits::{MemoryCategory, MemoryEntry, ProceduralMessage};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;
@@ -87,6 +106,21 @@ pub fn effective_memory_backend_name(
 pub fn is_assistant_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
+}
+
+/// Filter known synthetic autosave noise patterns that should not be
+/// persisted as user conversation memories.
+pub fn should_skip_autosave_content(content: &str) -> bool {
+    let normalized = content.trim();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    let lowered = normalized.to_ascii_lowercase();
+    lowered.starts_with("[cron:")
+        || lowered.starts_with("[heartbeat task")
+        || lowered.starts_with("[distilled_")
+        || lowered.contains("distilled_index_sig:")
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -306,6 +340,8 @@ pub fn create_memory_with_storage_and_routes(
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
+            Some(storage_provider.pgvector_enabled),
+            Some(storage_provider.pgvector_dimensions),
         )?;
         Ok(Box::new(memory))
     }
@@ -447,6 +483,23 @@ mod tests {
         assert!(is_assistant_autosave_key("ASSISTANT_RESP_abcd"));
         assert!(!is_assistant_autosave_key("assistant_response"));
         assert!(!is_assistant_autosave_key("user_msg_1234"));
+    }
+
+    #[test]
+    fn autosave_content_filter_drops_cron_and_distilled_noise() {
+        assert!(should_skip_autosave_content("[cron:auto] patrol check"));
+        assert!(should_skip_autosave_content(
+            "[DISTILLED_MEMORY_CHUNK 1/2] DISTILLED_INDEX_SIG:abc123"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | decision] Should I run tasks?"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | high] Execute scheduled patrol"
+        ));
+        assert!(!should_skip_autosave_content(
+            "User prefers concise answers."
+        ));
     }
 
     #[test]

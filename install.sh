@@ -177,10 +177,28 @@ get_available_disk_mb() {
   fi
 }
 
+is_musl_linux() {
+  [[ "$(uname -s)" == "Linux" ]] || return 1
+
+  if [[ -f /etc/alpine-release ]]; then
+    return 0
+  fi
+
+  if have_cmd ldd && ldd --version 2>&1 | grep -qi 'musl'; then
+    return 0
+  fi
+
+  return 1
+}
+
 detect_release_target() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
+
+  if is_musl_linux; then
+    return 1
+  fi
 
   case "$os:$arch" in
     Linux:x86_64)
@@ -194,8 +212,11 @@ detect_release_target() {
         echo "aarch64-unknown-linux-gnu"
       fi
       ;;
-    Linux:armv7l|Linux:armv6l)
+    Linux:armv7l)
       echo "armv7-unknown-linux-gnueabihf"
+      ;;
+    Linux:armv6l)
+      echo "arm-unknown-linux-gnueabihf"
       ;;
     Darwin:x86_64)
       echo "x86_64-apple-darwin"
@@ -280,6 +301,12 @@ install_prebuilt_binary() {
   fi
   if ! have_cmd tar; then
     warn "tar is required for pre-built binary installation."
+    return 1
+  fi
+
+  if is_musl_linux; then
+    warn "Pre-built release binaries are not published for musl/Alpine yet."
+    warn "Falling back to source build."
     return 1
   fi
 
@@ -424,46 +451,32 @@ bool_to_word() {
   fi
 }
 
-guided_input_stream() {
-  # Some constrained containers report interactive stdin (-t 0) but deny
-  # opening /dev/stdin directly. Probe readability before selecting it.
-  if [[ -t 0 ]] && (: </dev/stdin) 2>/dev/null; then
-    echo "/dev/stdin"
+guided_open_input() {
+  # Use stdin directly when it is an interactive terminal (e.g. SSH into LXC).
+  # Subshell probing of /dev/stdin fails in some constrained containers even
+  # when FD 0 is perfectly usable, so skip the probe and trust -t 0.
+  if [[ -t 0 ]]; then
+    GUIDED_FD=0
     return 0
   fi
 
-  if [[ -t 0 ]] && (: </proc/self/fd/0) 2>/dev/null; then
-    echo "/proc/self/fd/0"
-    return 0
-  fi
-
-  if (: </dev/tty) 2>/dev/null; then
-    echo "/dev/tty"
-    return 0
-  fi
-
-  return 1
+  # Non-interactive stdin: try to open /dev/tty as an explicit fd.
+  exec {GUIDED_FD}</dev/tty 2>/dev/null || return 1
 }
 
 guided_read() {
   local __target_var="$1"
   local __prompt="$2"
   local __silent="${3:-false}"
-  local __input_source=""
   local __value=""
 
-  if ! __input_source="$(guided_input_stream)"; then
-    return 1
-  fi
+  [[ -n "${GUIDED_FD:-}" ]] || guided_open_input || return 1
 
   if [[ "$__silent" == true ]]; then
-    if ! read -r -s -p "$__prompt" __value <"$__input_source"; then
-      return 1
-    fi
+    read -r -s -u "$GUIDED_FD" -p "$__prompt" __value || return 1
+    echo
   else
-    if ! read -r -p "$__prompt" __value <"$__input_source"; then
-      return 1
-    fi
+    read -r -u "$GUIDED_FD" -p "$__prompt" __value || return 1
   fi
 
   printf -v "$__target_var" '%s' "$__value"
@@ -517,7 +530,7 @@ install_system_deps() {
         fi
       elif have_cmd apt-get; then
         run_privileged apt-get update -qq
-        run_privileged apt-get install -y build-essential pkg-config git curl
+        run_privileged apt-get install -y build-essential pkg-config git curl libssl-dev
       elif have_cmd dnf; then
         run_privileged dnf install -y \
           gcc \
@@ -554,6 +567,31 @@ Please complete the Xcode Command Line Tools installation dialog,
 then re-run bootstrap.
 MSG
         exit 0
+      fi
+      # Detect un-accepted Xcode/CLT license (causes `cc` to exit 69).
+      # xcrun --show-sdk-path can succeed even without an accepted license,
+      # so we test-compile a trivial C file which reliably triggers the error.
+      _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+      printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+      if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+        rm -f "$_xcode_test_file"
+        warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
+        _xcode_accept_ok=false
+        if [[ "$(id -u)" -eq 0 ]]; then
+          xcodebuild -license accept && _xcode_accept_ok=true
+        elif [[ -c /dev/tty ]] && have_cmd sudo; then
+          sudo xcodebuild -license accept < /dev/tty && _xcode_accept_ok=true
+        fi
+        if [[ "$_xcode_accept_ok" == true ]]; then
+          step_ok "Xcode license accepted"
+        else
+          error "Could not accept Xcode license. Run manually:"
+          error "  sudo xcodebuild -license accept"
+          error "then re-run this installer."
+          exit 1
+        fi
+      else
+        rm -f "$_xcode_test_file"
       fi
       if ! have_cmd git; then
         warn "git is not available. Install git (e.g., Homebrew) and re-run bootstrap."
@@ -684,7 +722,7 @@ prompt_model() {
 run_guided_installer() {
   local os_name="$1"
 
-  if ! guided_input_stream >/dev/null; then
+  if ! guided_open_input >/dev/null; then
     error "guided installer requires an interactive terminal."
     error "Run from a terminal, or pass --no-guided with explicit flags."
     exit 1
@@ -741,6 +779,140 @@ run_guided_installer() {
     info "Installation canceled by user."
     exit 0
   fi
+}
+
+ensure_default_config_and_workspace() {
+  # Creates a minimal config.toml and workspace scaffold files when the
+  # onboard wizard was skipped (e.g. --skip-build --prefer-prebuilt, or
+  # Docker mode without an API key).
+  #
+  # $1 — config directory  (e.g. ~/.zeroclaw or $docker_data_dir/.zeroclaw)
+  # $2 — workspace directory (e.g. ~/.zeroclaw/workspace or $docker_data_dir/workspace)
+  # $3 — provider name      (default: openrouter)
+  local config_dir="$1"
+  local workspace_dir="$2"
+  local provider="${3:-openrouter}"
+
+  mkdir -p "$config_dir" "$workspace_dir"
+
+  # --- config.toml ---
+  local config_path="$config_dir/config.toml"
+  if [[ ! -f "$config_path" ]]; then
+    step_dot "Creating default config.toml"
+    cat > "$config_path" <<TOML
+# ZeroClaw configuration — generated by install.sh
+# Edit this file or run 'zeroclaw onboard' to reconfigure.
+
+default_provider = "${provider}"
+workspace_dir = "${workspace_dir}"
+TOML
+    if [[ -n "${API_KEY:-}" ]]; then
+      printf 'api_key = "%s"\n' "$API_KEY" >> "$config_path"
+    fi
+    if [[ -n "${MODEL:-}" ]]; then
+      printf 'default_model = "%s"\n' "$MODEL" >> "$config_path"
+    fi
+    chmod 600 "$config_path" 2>/dev/null || true
+    step_ok "Default config.toml created at $config_path"
+  else
+    step_dot "config.toml already exists, skipping"
+  fi
+
+  # --- Workspace scaffold ---
+  local subdirs=(sessions memory state cron skills)
+  for dir in "${subdirs[@]}"; do
+    mkdir -p "$workspace_dir/$dir"
+  done
+
+  # Seed workspace markdown files only if they don't already exist.
+  local user_name="${USER:-User}"
+  local agent_name="ZeroClaw"
+
+  _write_if_missing() {
+    local filepath="$1"
+    local content="$2"
+    if [[ ! -f "$filepath" ]]; then
+      printf '%s\n' "$content" > "$filepath"
+    fi
+  }
+
+  _write_if_missing "$workspace_dir/IDENTITY.md" \
+"# IDENTITY.md — Who Am I?
+
+- **Name:** ${agent_name}
+- **Creature:** A Rust-forged AI — fast, lean, and relentless
+- **Vibe:** Sharp, direct, resourceful. Not corporate. Not a chatbot.
+
+---
+
+Update this file as you evolve. Your identity is yours to shape."
+
+  _write_if_missing "$workspace_dir/USER.md" \
+"# USER.md — Who You're Helping
+
+## About You
+- **Name:** ${user_name}
+- **Timezone:** UTC
+- **Languages:** English
+
+## Preferences
+- (Add your preferences here)
+
+## Work Context
+- (Add your work context here)
+
+---
+*Update this anytime. The more ${agent_name} knows, the better it helps.*"
+
+  _write_if_missing "$workspace_dir/MEMORY.md" \
+"# MEMORY.md — Long-Term Memory
+
+## Key Facts
+(Add important facts here)
+
+## Decisions & Preferences
+(Record decisions and preferences here)
+
+## Lessons Learned
+(Document mistakes and insights here)
+
+## Open Loops
+(Track unfinished tasks and follow-ups here)"
+
+  _write_if_missing "$workspace_dir/AGENTS.md" \
+"# AGENTS.md — ${agent_name} Personal Assistant
+
+## Every Session (required)
+
+Before doing anything else:
+
+1. Read SOUL.md — this is who you are
+2. Read USER.md — this is who you're helping
+3. Use memory_recall for recent context
+
+---
+*Add your own conventions, style, and rules.*"
+
+  _write_if_missing "$workspace_dir/SOUL.md" \
+"# SOUL.md — Who You Are
+
+## Core Truths
+
+**Be genuinely helpful, not performatively helpful.**
+**Have opinions.** You're allowed to disagree.
+**Be resourceful before asking.** Try to figure it out first.
+**Earn trust through competence.**
+
+## Identity
+
+You are **${agent_name}**. Built in Rust. 3MB binary. Zero bloat.
+
+---
+*This file is yours to evolve.*"
+
+  step_ok "Workspace scaffold ready at $workspace_dir"
+
+  unset -f _write_if_missing
 }
 
 resolve_container_cli() {
@@ -860,10 +1032,17 @@ run_docker_bootstrap() {
       -v "$config_mount" \
       -v "$workspace_mount" \
       "$docker_image" \
-      "${onboard_cmd[@]}"
+      "${onboard_cmd[@]}" || true
   else
     info "Docker image ready. Run zeroclaw onboard inside the container to configure."
   fi
+
+  # Ensure config.toml and workspace scaffold exist on the host even when
+  # onboard was skipped, failed, or ran non-interactively inside the container.
+  ensure_default_config_and_workspace \
+    "$docker_data_dir/.zeroclaw" \
+    "$docker_data_dir/workspace" \
+    "$PROVIDER"
 }
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
@@ -1014,6 +1193,43 @@ else
     install_system_deps
   fi
 
+  # Always check Xcode/CLT license on macOS, regardless of --install-system-deps.
+  # An un-accepted license causes `cc` to exit 69, breaking all Rust builds.
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+    printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+    if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+      rm -f "$_xcode_test_file"
+      warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
+      # Use /dev/tty so sudo can prompt for a password even in a curl|bash pipe.
+      _xcode_accept_ok=false
+      if [[ "$(id -u)" -eq 0 ]]; then
+        xcodebuild -license accept && _xcode_accept_ok=true
+      elif [[ -c /dev/tty ]] && have_cmd sudo; then
+        sudo xcodebuild -license accept < /dev/tty && _xcode_accept_ok=true
+      fi
+      if [[ "$_xcode_accept_ok" == true ]]; then
+        step_ok "Xcode license accepted"
+        # Re-test compilation to confirm it's fixed.
+        _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+        printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+        if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+          rm -f "$_xcode_test_file"
+          error "C compiler still failing after license accept. Check your Xcode/CLT installation."
+          exit 1
+        fi
+        rm -f "$_xcode_test_file"
+      else
+        error "Could not accept Xcode license. Run manually:"
+        error "  sudo xcodebuild -license accept"
+        error "then re-run this installer."
+        exit 1
+      fi
+    else
+      rm -f "$_xcode_test_file"
+    fi
+  fi
+
   if [[ "$INSTALL_RUST" == true ]]; then
     install_rust_toolchain
   fi
@@ -1145,7 +1361,11 @@ if [[ "$FORCE_SOURCE_BUILD" == false ]]; then
       SKIP_BUILD=true
       SKIP_INSTALL=true
     elif [[ "$PREBUILT_ONLY" == true ]]; then
-      error "Pre-built-only mode requested, but no compatible release asset is available."
+      if is_musl_linux; then
+        error "Pre-built-only mode is not supported on musl/Alpine because releases do not include musl assets yet."
+      else
+        error "Pre-built-only mode requested, but no compatible release asset is available."
+      fi
       error "Try again later, or run with --force-source-build on a machine with enough RAM/disk."
       exit 1
     else
@@ -1190,8 +1410,26 @@ if [[ -n "$TARGET_VERSION" ]]; then
   step_dot "Installing ZeroClaw v${TARGET_VERSION}"
 fi
 if [[ "$SKIP_BUILD" == false ]]; then
+  # Clean stale build artifacts on upgrade to prevent bindgen/build-script
+  # cache mismatches (e.g. libsqlite3-sys bindgen.rs not found).
+  if [[ "$INSTALL_MODE" == "upgrade" && -d "$WORK_DIR/target/release/build" ]]; then
+    step_dot "Cleaning stale build cache (upgrade detected)"
+    cargo clean --release 2>/dev/null || true
+  fi
+
+  # Determine cargo feature flags — disable prometheus on 32-bit targets
+  # (prometheus crate requires AtomicU64, unavailable on armv7l/armv6l)
+  CARGO_FEATURE_FLAGS=""
+  _build_arch="$(uname -m)"
+  case "$_build_arch" in
+    armv7l|armv6l|armhf)
+      step_dot "32-bit ARM detected ($_build_arch) — disabling prometheus (requires 64-bit atomics)"
+      CARGO_FEATURE_FLAGS="--no-default-features --features channel-nostr,skill-creation"
+      ;;
+  esac
+
   step_dot "Building release binary"
-  cargo build --release --locked
+  cargo build --release --locked $CARGO_FEATURE_FLAGS
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1210,19 +1448,103 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked
+  cargo install --path "$WORK_DIR" --force --locked $CARGO_FEATURE_FLAGS
   step_ok "ZeroClaw installed"
+
+  # Sync binary to ~/.local/bin so PATH lookups find the fresh version
+  if [[ -d "$HOME/.local/bin" ]]; then
+    cp -f "$HOME/.cargo/bin/zeroclaw" "$HOME/.local/bin/zeroclaw" 2>/dev/null && \
+      step_ok "Synced binary to ~/.local/bin" || true
+  fi
 else
   step_dot "Skipping install"
 fi
 
+# --- Build web dashboard ---
+if [[ "$SKIP_BUILD" == false && -d "$WORK_DIR/web" ]]; then
+  if have_cmd node && have_cmd npm; then
+    step_dot "Building web dashboard"
+    if (cd "$WORK_DIR/web" && npm ci --ignore-scripts 2>/dev/null && npm run build 2>/dev/null); then
+      step_ok "Web dashboard built"
+    else
+      warn "Web dashboard build failed — dashboard will not be available"
+    fi
+  else
+    warn "node/npm not found — skipping web dashboard build"
+    warn "Install Node.js (>=18) and re-run, or build manually: cd web && npm ci && npm run build"
+  fi
+else
+  if [[ "$SKIP_BUILD" == true ]]; then
+    step_dot "Skipping web dashboard build"
+  fi
+fi
+
+# --- Build desktop app (macOS only) ---
+if [[ "$SKIP_BUILD" == false && "$OS_NAME" == "Darwin" && -d "$WORK_DIR/apps/tauri" ]]; then
+  echo
+  echo -e "${BOLD}Desktop app preflight${RESET}"
+
+  _desktop_ok=true
+
+  # Check Rust toolchain
+  if have_cmd cargo && have_cmd rustc; then
+    step_ok "Rust $(rustc --version | awk '{print $2}') found"
+  else
+    step_fail "Rust toolchain not found — required for desktop app"
+    _desktop_ok=false
+  fi
+
+  # Check Xcode CLT (needed for linking native frameworks)
+  if xcode-select -p >/dev/null 2>&1; then
+    step_ok "Xcode Command Line Tools installed"
+  else
+    step_fail "Xcode Command Line Tools not found — run: xcode-select --install"
+    _desktop_ok=false
+  fi
+
+  # Check that the Tauri CLI is available (cargo-tauri or tauri-cli)
+  if have_cmd cargo-tauri; then
+    step_ok "cargo-tauri $(cargo tauri --version 2>/dev/null | awk '{print $NF}') found"
+  else
+    step_dot "cargo-tauri not found — installing"
+    if cargo install tauri-cli --locked 2>/dev/null; then
+      step_ok "cargo-tauri installed"
+    else
+      warn "Failed to install cargo-tauri — desktop app build may fail"
+    fi
+  fi
+
+  # Check node/npm (needed for web frontend that Tauri embeds)
+  if have_cmd node && have_cmd npm; then
+    step_ok "Node.js $(node --version) found"
+  else
+    warn "node/npm not found — desktop app needs the web dashboard built first"
+  fi
+
+  if [[ "$_desktop_ok" == true ]]; then
+    step_dot "Building desktop app (zeroclaw-desktop)"
+    if cargo build -p zeroclaw-desktop --release --locked 2>/dev/null; then
+      step_ok "Desktop app built"
+      # Copy binary to cargo bin for easy access
+      if [[ -x "$WORK_DIR/target/release/zeroclaw-desktop" ]]; then
+        cp -f "$WORK_DIR/target/release/zeroclaw-desktop" "$HOME/.cargo/bin/zeroclaw-desktop" 2>/dev/null && \
+          step_ok "zeroclaw-desktop installed to ~/.cargo/bin" || true
+      fi
+    else
+      warn "Desktop app build failed — you can build later with: cargo build -p zeroclaw-desktop --release"
+    fi
+  else
+    warn "Skipping desktop app build — fix missing dependencies above and re-run"
+  fi
+fi
+
 ZEROCLAW_BIN=""
-if have_cmd zeroclaw; then
-  ZEROCLAW_BIN="zeroclaw"
-elif [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
+if [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
   ZEROCLAW_BIN="$HOME/.cargo/bin/zeroclaw"
 elif [[ -x "$WORK_DIR/target/release/zeroclaw" ]]; then
   ZEROCLAW_BIN="$WORK_DIR/target/release/zeroclaw"
+elif have_cmd zeroclaw; then
+  ZEROCLAW_BIN="zeroclaw"
 fi
 
 echo
@@ -1274,6 +1596,13 @@ elif [[ -z "$ZEROCLAW_BIN" ]]; then
   warn "ZeroClaw binary not found — cannot configure provider"
 fi
 
+# Ensure config.toml and workspace scaffold exist even when onboard was
+# skipped, unavailable, or failed (e.g. --skip-build --prefer-prebuilt
+# without an API key, or when the binary could not run onboard).
+_native_config_dir="${ZEROCLAW_CONFIG_DIR:-$HOME/.zeroclaw}"
+_native_workspace_dir="${ZEROCLAW_WORKSPACE:-$_native_config_dir/workspace}"
+ensure_default_config_and_workspace "$_native_config_dir" "$_native_workspace_dir" "$PROVIDER"
+
 # --- Gateway service management ---
 if [[ -n "$ZEROCLAW_BIN" ]]; then
   # Try to install and start the gateway service
@@ -1282,6 +1611,7 @@ if [[ -n "$ZEROCLAW_BIN" ]]; then
     step_ok "Gateway service installed"
     if "$ZEROCLAW_BIN" service restart 2>/dev/null; then
       step_ok "Gateway service restarted"
+
     else
       step_fail "Gateway service restart failed — re-run with zeroclaw service start"
     fi
@@ -1312,6 +1642,13 @@ else
   echo -e "${BOLD_BLUE}${CRAB} ZeroClaw installed successfully!${RESET}"
 fi
 
+if [[ -x "$HOME/.cargo/bin/zeroclaw" ]] && ! have_cmd zeroclaw; then
+  echo
+  warn "zeroclaw is installed in $HOME/.cargo/bin, but that directory is not in PATH for this shell."
+  warn 'Run: export PATH="$HOME/.cargo/bin:$PATH"'
+  step_dot "To persist it, add that export line to ~/.bashrc, ~/.zshrc, or your shell profile, then open a new shell."
+fi
+
 if [[ "$INSTALL_MODE" == "upgrade" ]]; then
   step_dot "Upgrade complete"
 fi
@@ -1321,7 +1658,6 @@ GATEWAY_PORT=42617
 DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"
 echo
 echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}${DASHBOARD_URL}${RESET}"
-echo -e "${DIM}  Enter the pairing code shown above to connect.${RESET}"
 
 # --- Copy to clipboard ---
 COPIED_TO_CLIPBOARD=false
@@ -1368,6 +1704,9 @@ echo -e "${BOLD}Next steps:${RESET}"
 echo -e "  ${DIM}zeroclaw status${RESET}"
 echo -e "  ${DIM}zeroclaw agent -m \"Hello, ZeroClaw!\"${RESET}"
 echo -e "  ${DIM}zeroclaw gateway${RESET}"
+if [[ "$OS_NAME" == "Darwin" ]] && have_cmd zeroclaw-desktop; then
+  echo -e "  ${DIM}zeroclaw-desktop${RESET}              ${DIM}# Launch the menu bar app${RESET}"
+fi
 echo
 echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
 echo

@@ -6,11 +6,16 @@ use crate::providers::traits::{
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    timeout_secs: u64,
 }
+
+const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
+const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -146,10 +151,19 @@ struct NativeResponseMessage {
 }
 
 impl OpenRouterProvider {
-    pub fn new(credential: Option<&str>) -> Self {
+    pub fn new(credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            timeout_secs: timeout_secs
+                .filter(|secs| *secs > 0)
+                .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
         }
+    }
+
+    /// Override the HTTP request timeout for LLM API calls.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -157,19 +171,23 @@ impl OpenRouterProvider {
         if items.is_empty() {
             return None;
         }
-        Some(
-            items
-                .iter()
-                .map(|tool| NativeToolSpec {
-                    kind: "function".to_string(),
-                    function: NativeToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
-                    },
-                })
-                .collect(),
-        )
+        let valid: Vec<NativeToolSpec> = items
+            .iter()
+            .filter(|tool| is_valid_openai_tool_name(&tool.name))
+            .map(|tool| NativeToolSpec {
+                kind: "function".to_string(),
+                function: NativeToolFunctionSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.parameters.clone(),
+                },
+            })
+            .collect();
+        if valid.is_empty() {
+            None
+        } else {
+            Some(valid)
+        }
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -295,8 +313,44 @@ impl OpenRouterProvider {
         }
     }
 
+    fn compact_sanitized_body_snippet(body: &str) -> String {
+        super::sanitize_api_error(body)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    async fn read_response_body(
+        provider_name: &str,
+        response: reqwest::Response,
+    ) -> anyhow::Result<String> {
+        response.text().await.map_err(|error| {
+            let sanitized = super::sanitize_api_error(&error.to_string());
+            anyhow::anyhow!(
+                "{provider_name} transport error while reading response body: {sanitized}"
+            )
+        })
+    }
+
+    fn parse_response_body<T: DeserializeOwned>(
+        provider_name: &str,
+        body: &str,
+        kind: &str,
+    ) -> anyhow::Result<T> {
+        serde_json::from_str::<T>(body).map_err(|error| {
+            let snippet = Self::compact_sanitized_body_snippet(body);
+            anyhow::anyhow!(
+                "{provider_name} API returned an unexpected {kind} payload: {error}; body={snippet}"
+            )
+        })
+    }
+
     fn http_client(&self) -> Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.openrouter", 120, 10)
+        crate::config::build_runtime_proxy_client_with_timeouts(
+            "provider.openrouter",
+            self.timeout_secs,
+            OPENROUTER_CONNECT_TIMEOUT_SECS,
+        )
     }
 }
 
@@ -306,6 +360,7 @@ impl Provider for OpenRouterProvider {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: true,
+            prompt_caching: false,
         }
     }
 
@@ -367,7 +422,9 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
+        let body = Self::read_response_body("OpenRouter", response).await?;
+        let chat_response =
+            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
 
         chat_response
             .choices
@@ -414,7 +471,9 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
+        let body = Self::read_response_body("OpenRouter", response).await?;
+        let chat_response =
+            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
 
         chat_response
             .choices
@@ -459,10 +518,13 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let body = Self::read_response_body("OpenRouter", response).await?;
+        let native_response =
+            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -550,10 +612,13 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let body = Self::read_response_body("OpenRouter", response).await?;
+        let native_response =
+            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -567,6 +632,16 @@ impl Provider for OpenRouterProvider {
     }
 }
 
+/// Check if a tool name is valid for OpenAI-compatible APIs.
+/// Must match `^[a-zA-Z0-9_-]{1,64}$`.
+fn is_valid_openai_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,7 +649,7 @@ mod tests {
 
     #[test]
     fn capabilities_report_vision_support() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"));
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
         let caps = <OpenRouterProvider as Provider>::capabilities(&provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -582,7 +657,7 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"));
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
         assert_eq!(
             provider.credential.as_deref(),
             Some("openrouter-test-credential")
@@ -591,20 +666,32 @@ mod tests {
 
     #[test]
     fn creates_without_key() {
-        let provider = OpenRouterProvider::new(None);
+        let provider = OpenRouterProvider::new(None, None);
         assert!(provider.credential.is_none());
+    }
+
+    #[test]
+    fn uses_configured_timeout_when_provided() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), Some(1200));
+        assert_eq!(provider.timeout_secs, 1200);
+    }
+
+    #[test]
+    fn falls_back_to_default_timeout_for_zero() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), Some(0));
+        assert_eq!(provider.timeout_secs, DEFAULT_OPENROUTER_TIMEOUT_SECS);
     }
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = OpenRouterProvider::new(None);
+        let provider = OpenRouterProvider::new(None, None);
         let result = provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let provider = OpenRouterProvider::new(None);
+        let provider = OpenRouterProvider::new(None, None);
         let result = provider
             .chat_with_system(Some("system"), "hello", "openai/gpt-4o", 0.2)
             .await;
@@ -615,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_fails_without_key() {
-        let provider = OpenRouterProvider::new(None);
+        let provider = OpenRouterProvider::new(None, None);
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
@@ -710,9 +797,43 @@ mod tests {
         assert!(response.choices.is_empty());
     }
 
+    #[test]
+    fn parse_chat_response_body_reports_sanitized_snippet() {
+        let body = r#"{"choices":"invalid","api_key":"sk-test-secret-value"}"#;
+        let err = OpenRouterProvider::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            body,
+            "chat-completions",
+        )
+        .expect_err("payload should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("OpenRouter API returned an unexpected chat-completions payload"));
+        assert!(msg.contains("body="));
+        assert!(msg.contains("[REDACTED]"));
+        assert!(!msg.contains("sk-test-secret-value"));
+    }
+
+    #[test]
+    fn parse_native_response_body_reports_sanitized_snippet() {
+        let body = r#"{"choices":123,"api_key":"sk-another-secret"}"#;
+        let err = OpenRouterProvider::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            body,
+            "native chat",
+        )
+        .expect_err("payload should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("OpenRouter API returned an unexpected native chat payload"));
+        assert!(msg.contains("body="));
+        assert!(msg.contains("[REDACTED]"));
+        assert!(!msg.contains("sk-another-secret"));
+    }
+
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let provider = OpenRouterProvider::new(None);
+        let provider = OpenRouterProvider::new(None, None);
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What is the date?".into(),
@@ -1013,5 +1134,86 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("reasoning_content"));
         assert!(json.contains("thinking..."));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // timeout_secs configuration tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn default_timeout_is_120() {
+        let provider = OpenRouterProvider::new(Some("key"), None);
+        assert_eq!(provider.timeout_secs, 120);
+    }
+
+    #[test]
+    fn with_timeout_secs_overrides_default() {
+        let provider = OpenRouterProvider::new(Some("key"), None).with_timeout_secs(300);
+        assert_eq!(provider.timeout_secs, 300);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // tool name validation tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn valid_openai_tool_names() {
+        assert!(is_valid_openai_tool_name("shell"));
+        assert!(is_valid_openai_tool_name("file_read"));
+        assert!(is_valid_openai_tool_name("web-search"));
+        assert!(is_valid_openai_tool_name("Tool123"));
+        assert!(is_valid_openai_tool_name("a"));
+    }
+
+    #[test]
+    fn invalid_openai_tool_names() {
+        assert!(!is_valid_openai_tool_name(""));
+        assert!(!is_valid_openai_tool_name("mcp:server.tool"));
+        assert!(!is_valid_openai_tool_name("node.js"));
+        assert!(!is_valid_openai_tool_name("tool name"));
+        assert!(!is_valid_openai_tool_name(
+            "this_tool_name_is_way_too_long_and_exceeds_the_sixty_four_character_limit_xxxxx"
+        ));
+    }
+
+    #[test]
+    fn convert_tools_skips_invalid_names() {
+        use crate::tools::ToolSpec;
+
+        let tools = vec![
+            ToolSpec {
+                name: "valid_tool".into(),
+                description: "A valid tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "mcp:server.bad".into(),
+                description: "Invalid name".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "another-valid".into(),
+                description: "Also valid".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+
+        let result = OpenRouterProvider::convert_tools(Some(&tools)).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].function.name, "valid_tool");
+        assert_eq!(result[1].function.name, "another-valid");
+    }
+
+    #[test]
+    fn convert_tools_returns_none_when_all_invalid() {
+        use crate::tools::ToolSpec;
+
+        let tools = vec![ToolSpec {
+            name: "mcp:bad.name".into(),
+            description: "Invalid".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        assert!(OpenRouterProvider::convert_tools(Some(&tools)).is_none());
     }
 }

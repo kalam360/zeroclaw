@@ -35,11 +35,19 @@ export interface ToolSpec {
 export interface CronJob {
   id: string;
   name: string | null;
+  expression: string;
   command: string;
+  prompt: string | null;
+  job_type: string;
+  schedule: unknown;
+  enabled: boolean;
+  delivery: unknown;
+  delete_after_run: boolean;
+  created_at: string;
   next_run: string;
   last_run: string | null;
   last_status: string | null;
-  enabled: boolean;
+  last_output: string | null;
 }
 
 export interface CronRun {
@@ -105,11 +113,12 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type: 'message' | 'chunk' | 'chunk_reset' | 'tool_call' | 'tool_result' | 'done' | 'error';
   content?: string;
   full_response?: string;
   name?: string;
   args?: any;
   output?: string;
   message?: string;
+  code?: string;
 }

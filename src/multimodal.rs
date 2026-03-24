@@ -507,6 +507,7 @@ mod tests {
             max_images: 1,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
@@ -549,6 +550,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
@@ -565,5 +567,29 @@ mod tests {
         let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
             .expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
+    }
+
+    /// Stripping `[IMAGE:]` markers from history messages leaves only the text
+    /// portion, which is the behaviour needed for non-vision providers (#3674).
+    #[test]
+    fn parse_image_markers_strips_markers_leaving_caption() {
+        let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert_eq!(cleaned, "Describe this screenshot");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], "/tmp/photo.jpg");
+    }
+
+    /// An image-only message (no caption) should produce an empty string after
+    /// marker stripping, so callers can drop it from history.
+    #[test]
+    fn parse_image_markers_image_only_message_becomes_empty() {
+        let input = "[IMAGE:/tmp/photo.jpg]";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert!(
+            cleaned.is_empty(),
+            "expected empty string, got: {cleaned:?}"
+        );
+        assert_eq!(refs.len(), 1);
     }
 }

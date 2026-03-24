@@ -12,6 +12,15 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Thread scope identifier for interruption/cancellation grouping.
+    /// Distinct from `thread_ts` (reply anchor): this is `Some` only when the message
+    /// is genuinely inside a reply thread and should be isolated from other threads.
+    /// `None` means top-level — scope is sender+channel only.
+    pub interruption_scope_id: Option<String>,
+    /// Media attachments (audio, images, video) for the media pipeline.
+    /// Channels populate this when they receive media alongside a text message.
+    /// Defaults to empty — existing channels are unaffected.
+    pub attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 /// Message to send through a channel
@@ -152,6 +161,20 @@ pub trait Channel: Send + Sync {
     async fn unpin_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Redact (delete) a message from the channel.
+    ///
+    /// `channel_id` is the platform channel/conversation identifier.
+    /// `message_id` is the platform-scoped message identifier.
+    /// `reason` is an optional reason for the redaction (may be visible in audit logs).
+    async fn redact_message(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +205,8 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -198,6 +223,8 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
         };
 
         let cloned = message.clone();
@@ -265,5 +292,19 @@ mod tests {
         assert_eq!(received.sender, "tester");
         assert_eq!(received.content, "hello");
         assert_eq!(received.channel, "dummy");
+    }
+
+    #[tokio::test]
+    async fn default_redact_message_returns_success() {
+        let channel = DummyChannel;
+
+        assert!(channel
+            .redact_message("chan_1", "msg_1", Some("spam".to_string()))
+            .await
+            .is_ok());
+        assert!(channel
+            .redact_message("chan_1", "msg_2", None)
+            .await
+            .is_ok());
     }
 }
