@@ -586,6 +586,11 @@ pub struct DelegateAgentConfig {
     /// When unset or empty, the sub-agent falls back to the default workspace `skills/` directory.
     #[serde(default)]
     pub skills_directory: Option<String>,
+    /// Optional memory namespace for isolation.
+    /// When set, the sub-agent's memory operations are isolated to this namespace,
+    /// preventing cross-contamination with memory from other agents.
+    #[serde(default)]
+    pub memory_namespace: Option<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -1363,6 +1368,27 @@ pub struct AgentConfig {
     /// Context compression configuration for automatic conversation compaction.
     #[serde(default)]
     pub context_compression: crate::agent::context_compressor::ContextCompressionConfig,
+
+    /// Maximum characters for a single tool result before truncation.
+    /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
+    /// middle. Set to `0` to disable truncation. Default: `50000`.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
+
+    /// Number of most recent conversation turns whose full tool-call/result
+    /// messages are preserved in channel conversation history. Older turns
+    /// keep only the final assistant text. Set to `0` to disable (previous
+    /// behavior). Default: `2`.
+    #[serde(default = "default_keep_tool_context_turns")]
+    pub keep_tool_context_turns: usize,
+}
+
+fn default_max_tool_result_chars() -> usize {
+    50_000
+}
+
+fn default_keep_tool_context_turns() -> usize {
+    2
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1404,6 +1430,8 @@ impl Default for AgentConfig {
             auto_classify: None,
             context_compression:
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
+            max_tool_result_chars: default_max_tool_result_chars(),
+            keep_tool_context_turns: default_keep_tool_context_turns(),
         }
     }
 }
@@ -4116,17 +4144,26 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
-        std::env::set_var(key, &value);
-        std::env::set_var(lowercase_key, value);
+        // SAFETY: called during single-threaded config init before async runtime starts.
+        unsafe {
+            std::env::set_var(key, &value);
+            std::env::set_var(lowercase_key, value);
+        }
     } else {
-        std::env::remove_var(key);
-        std::env::remove_var(lowercase_key);
+        // SAFETY: called during single-threaded config init before async runtime starts.
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(lowercase_key);
+        }
     }
 }
 
 fn clear_proxy_env_pair(key: &str) {
-    std::env::remove_var(key);
-    std::env::remove_var(key.to_ascii_lowercase());
+    // SAFETY: called during single-threaded config init before async runtime starts.
+    unsafe {
+        std::env::remove_var(key);
+        std::env::remove_var(key.to_ascii_lowercase());
+    }
 }
 
 fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {
@@ -5247,6 +5284,14 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Timeout in seconds for shell tool subprocesses. Default: 60.
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    60
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -5342,6 +5387,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            shell_timeout_secs: default_shell_timeout_secs(),
         }
     }
 }
@@ -5721,7 +5767,7 @@ pub struct HeartbeatConfig {
 }
 
 fn default_heartbeat_interval() -> u32 {
-    5
+    30
 }
 
 fn default_two_phase() -> bool {
@@ -6095,6 +6141,8 @@ pub struct ChannelsConfig {
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
     pub voice_wake: Option<VoiceWakeConfig>,
+    /// MQTT channel configuration (SOP listener).
+    pub mqtt: Option<MqttConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -6122,6 +6170,11 @@ pub struct ChannelsConfig {
     /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
+    /// Inbound message debounce window in milliseconds. When a sender fires
+    /// multiple messages within this window, they are accumulated and dispatched
+    /// as a single concatenated message. `0` disables debouncing. Default: `0`.
+    #[serde(default)]
+    pub debounce_ms: u64,
 }
 
 impl ChannelsConfig {
@@ -6227,6 +6280,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
                 self.voice_wake.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.mqtt.as_ref())),
+                self.mqtt.is_some(),
+            ),
         ]
     }
 
@@ -6278,6 +6335,7 @@ impl Default for ChannelsConfig {
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
+            mqtt: None,
             reddit: None,
             bluesky: None,
             voice_call: None,
@@ -6289,6 +6347,7 @@ impl Default for ChannelsConfig {
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            debounce_ms: 0,
         }
     }
 }
@@ -6399,6 +6458,10 @@ pub struct DiscordConfig {
     /// Only used when `stream_mode = "multi_message"`.
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
+    /// Stall-watchdog timeout in seconds. When non-zero, the bot will abort
+    /// and retry if no progress is made within this duration. 0 = disabled.
+    #[serde(default)]
+    pub stall_timeout_secs: u64,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -6488,6 +6551,11 @@ pub struct SlackConfig {
     /// Minimum interval (ms) between draft message edits to avoid Slack rate limits.
     #[serde(default = "default_slack_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Emoji reaction name (without colons) that cancels an in-flight request.
+    /// For example, `"x"` means reacting with `:x:` cancels the task.
+    /// Leave unset to disable reaction-based cancellation.
+    #[serde(default)]
+    pub cancel_reaction: Option<String>,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -6626,6 +6694,10 @@ pub struct MatrixConfig {
     /// Delay (ms) between sending each paragraph in MultiMessage mode.
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
+    /// Optional Matrix recovery key for automatic E2EE key backup restore.
+    /// When set, ZeroClaw recovers room keys and cross-signing secrets on startup.
+    #[serde(default)]
+    pub recovery_key: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -6739,6 +6811,11 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups (Web mode only).
+    /// Direct messages are always processed.
+    /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
     /// In personal mode the bot applies dm_policy, group_policy, and
     /// self_chat_mode to decide which chats to respond in.
@@ -6858,6 +6935,11 @@ pub struct NextcloudTalkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Display name of the bot in Nextcloud Talk (e.g. "zeroclaw").
+    /// Used to filter out the bot's own messages and prevent feedback loops.
+    /// If not set, defaults to an empty string (no self-message filtering by name).
+    #[serde(default)]
+    pub bot_name: Option<String>,
 }
 
 impl ChannelConfig for NextcloudTalkConfig {
@@ -6899,6 +6981,106 @@ impl WhatsAppConfig {
     pub fn is_ambiguous_config(&self) -> bool {
         self.phone_number_id.is_some() && self.session_path.is_some()
     }
+}
+
+/// MQTT channel configuration (SOP listener).
+///
+/// Subscribes to MQTT topics and dispatches incoming messages
+/// to the SOP engine for processing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MqttConfig {
+    /// MQTT broker URL (e.g., `mqtt://localhost:1883` or `mqtts://broker.example.com:8883`).
+    /// Use `mqtt://` for plain connections or `mqtts://` for TLS.
+    pub broker_url: String,
+    /// MQTT client ID (must be unique per broker).
+    pub client_id: String,
+    /// Topics to subscribe to (e.g., `sensors/#`, `alerts/+/critical`).
+    /// At least one topic is required.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// MQTT QoS level (0 = at-most-once, 1 = at-least-once, 2 = exactly-once). Default: 1.
+    #[serde(default = "default_mqtt_qos")]
+    pub qos: u8,
+    /// Username for authentication (optional).
+    pub username: Option<String>,
+    /// Password for authentication (optional).
+    pub password: Option<String>,
+    /// Enable TLS encryption. Must match the broker_url scheme:
+    /// - `mqtt://` → `use_tls: false`
+    /// - `mqtts://` → `use_tls: true`
+    #[serde(default)]
+    pub use_tls: bool,
+    /// Keep-alive interval in seconds (default: 30). Prevents broker disconnect on idle.
+    #[serde(default = "default_mqtt_keep_alive_secs")]
+    pub keep_alive_secs: u64,
+}
+
+impl MqttConfig {
+    /// Validate the MQTT configuration.
+    ///
+    /// Checks:
+    /// - QoS is 0, 1, or 2
+    /// - broker_url uses valid scheme (`mqtt://` or `mqtts://`)
+    /// - `use_tls` flag matches broker_url scheme
+    /// - At least one topic is configured
+    /// - client_id is non-empty
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // QoS validation
+        if self.qos > 2 {
+            anyhow::bail!("qos must be 0, 1, or 2, got {}", self.qos);
+        }
+
+        // Broker URL validation
+        let is_tls_scheme = self.broker_url.starts_with("mqtts://");
+        let is_mqtt_scheme = self.broker_url.starts_with("mqtt://");
+
+        if !is_tls_scheme && !is_mqtt_scheme {
+            anyhow::bail!(
+                "broker_url must start with 'mqtt://' or 'mqtts://', got: {}",
+                self.broker_url
+            );
+        }
+
+        // TLS flag validation
+        if is_mqtt_scheme && self.use_tls {
+            anyhow::bail!("use_tls is true but broker_url uses 'mqtt://' (not 'mqtts://')");
+        }
+
+        if is_tls_scheme && !self.use_tls {
+            anyhow::bail!(
+                "use_tls is false but broker_url uses 'mqtts://' (requires use_tls: true)"
+            );
+        }
+
+        // Topics validation
+        if self.topics.is_empty() {
+            anyhow::bail!("at least one topic must be configured");
+        }
+
+        // Client ID validation
+        if self.client_id.is_empty() {
+            anyhow::bail!("client_id must not be empty");
+        }
+
+        Ok(())
+    }
+}
+
+impl ChannelConfig for MqttConfig {
+    fn name() -> &'static str {
+        "MQTT"
+    }
+    fn desc() -> &'static str {
+        "MQTT SOP Listener"
+    }
+}
+
+fn default_mqtt_qos() -> u8 {
+    1
+}
+
+fn default_mqtt_keep_alive_secs() -> u64 {
+    30
 }
 
 /// IRC channel configuration.
@@ -8989,6 +9171,11 @@ impl Config {
                     &mut mx.access_token,
                     "config.channels_config.matrix.access_token",
                 )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut mx.recovery_key,
+                    "config.channels_config.matrix.recovery_key",
+                )?;
             }
             if let Some(ref mut wa) = config.channels_config.whatsapp {
                 decrypt_optional_secret(
@@ -9400,9 +9587,9 @@ impl Config {
             &self.security.otp.gated_domains,
             &self.security.otp.gated_domain_categories,
         )
-        .with_context(|| {
-            "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
-        })?;
+        .with_context(
+            || "Invalid security.otp.gated_domains or security.otp.gated_domain_categories",
+        )?;
         if self.security.estop.state_file.trim().is_empty() {
             anyhow::bail!("security.estop.state_file must not be empty");
         }
@@ -9587,7 +9774,9 @@ impl Config {
                     .as_deref()
                     .map_or(true, |s| s.trim().is_empty())
             {
-                anyhow::bail!("microsoft365.client_secret must not be empty when auth_flow is client_credentials");
+                anyhow::bail!(
+                    "microsoft365.client_secret must not be empty when auth_flow is client_credentials"
+                );
             }
         }
 
@@ -10006,7 +10195,7 @@ impl Config {
         // Skills script-file audit override: ZEROCLAW_SKILLS_ALLOW_SCRIPTS
         if let Ok(flag) = std::env::var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") {
             if !flag.trim().is_empty() {
-                match flag.trim().to_ascii_lowercase().as_str(){
+                match flag.trim().to_ascii_lowercase().as_str() {
                     "1" | "true" | "yes" | "on" => self.skills.allow_scripts = true,
                     "0" | "false" | "no" | "off" => self.skills.allow_scripts = false,
                     _ => tracing::warn!(
@@ -10456,6 +10645,11 @@ impl Config {
                 &mut mx.access_token,
                 "config.channels_config.matrix.access_token",
             )?;
+            encrypt_optional_secret(
+                &store,
+                &mut mx.recovery_key,
+                "config.channels_config.matrix.recovery_key",
+            )?;
         }
         if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
             encrypt_optional_secret(
@@ -10837,8 +11031,8 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
-    use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::ReadDirStream;
 
     // ── Tilde expansion ───────────────────────────────────────
 
@@ -11063,7 +11257,7 @@ mod tests {
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
-        assert_eq!(h.interval_minutes, 5);
+        assert_eq!(h.interval_minutes, 30);
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());
@@ -11264,6 +11458,7 @@ auto_save = true
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                shell_timeout_secs: default_shell_timeout_secs(),
             },
             trust: crate::trust::TrustConfig::default(),
             backup: BackupConfig::default(),
@@ -11335,12 +11530,14 @@ auto_save = true
                 voice_call: None,
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
+                mqtt: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
+                debounce_ms: 0,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -11511,7 +11708,10 @@ auto_approve = ["my_custom_tool", "another_tool"]
             "web_fetch",
         ] {
             assert!(
-                parsed.autonomy.auto_approve.contains(&default_tool.to_string()),
+                parsed
+                    .autonomy
+                    .auto_approve
+                    .contains(&String::from(*default_tool)),
                 "default tool '{default_tool}' must be present in auto_approve even when user provides custom list"
             );
         }
@@ -11926,10 +12126,12 @@ default_temperature = 0.7
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let loaded: Config = toml::from_str(&contents).unwrap();
-        assert!(loaded
-            .api_key
-            .as_deref()
-            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert!(
+            loaded
+                .api_key
+                .as_deref()
+                .is_some_and(crate::security::SecretStore::is_encrypted)
+        );
         let store = crate::security::SecretStore::new(&dir, true);
         let decrypted = store.decrypt(loaded.api_key.as_deref().unwrap()).unwrap();
         assert_eq!(decrypted, "sk-roundtrip");
@@ -11981,6 +12183,7 @@ default_temperature = 0.7
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
 
@@ -12040,20 +12243,24 @@ default_temperature = 0.7
             &feishu.app_secret
         ));
         assert_eq!(store.decrypt(&feishu.app_secret).unwrap(), "feishu-secret");
-        assert!(feishu
-            .encrypt_key
-            .as_deref()
-            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert!(
+            feishu
+                .encrypt_key
+                .as_deref()
+                .is_some_and(crate::security::SecretStore::is_encrypted)
+        );
         assert_eq!(
             store
                 .decrypt(feishu.encrypt_key.as_deref().unwrap())
                 .unwrap(),
             "feishu-encrypt"
         );
-        assert!(feishu
-            .verification_token
-            .as_deref()
-            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert!(
+            feishu
+                .verification_token
+                .as_deref()
+                .is_some_and(crate::security::SecretStore::is_encrypted)
+        );
         assert_eq!(
             store
                 .decrypt(feishu.verification_token.as_deref().unwrap())
@@ -12139,6 +12346,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12159,6 +12367,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12212,6 +12421,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            recovery_key: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12237,6 +12447,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            recovery_key: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12334,6 +12545,7 @@ allowed_users = ["@ops:matrix.org"]
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                recovery_key: None,
             }),
             signal: None,
             whatsapp: None,
@@ -12358,12 +12570,14 @@ allowed_users = ["@ops:matrix.org"]
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
+            mqtt: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            debounce_ms: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -12555,6 +12769,7 @@ channel_ids = ["C123", "D456"]
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+            mention_only: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -12582,6 +12797,7 @@ channel_ids = ["C123", "D456"]
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            mention_only: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -12614,6 +12830,7 @@ channel_ids = ["C123", "D456"]
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
+            mention_only: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -12638,6 +12855,7 @@ channel_ids = ["C123", "D456"]
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            mention_only: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -12661,6 +12879,7 @@ channel_ids = ["C123", "D456"]
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
+            mention_only: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -12695,6 +12914,7 @@ channel_ids = ["C123", "D456"]
                 pair_phone: None,
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
+                mention_only: false,
                 mode: WhatsAppWebMode::default(),
                 dm_policy: WhatsAppChatPolicy::default(),
                 group_policy: WhatsAppChatPolicy::default(),
@@ -12724,12 +12944,14 @@ channel_ids = ["C123", "D456"]
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
+            mqtt: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            debounce_ms: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -13076,7 +13298,8 @@ default_temperature = 0.7
             "all_proxy",
             "no_proxy",
         ] {
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
         }
     }
 
@@ -13086,11 +13309,13 @@ default_temperature = 0.7
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
-        std::env::set_var("ZEROCLAW_API_KEY", "sk-test-env-key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_API_KEY", "sk-test-env-key") };
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-test-env-key"));
 
-        std::env::remove_var("ZEROCLAW_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_API_KEY") };
     }
 
     #[test]
@@ -13098,12 +13323,15 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_API_KEY");
-        std::env::set_var("API_KEY", "sk-fallback-key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_API_KEY") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("API_KEY", "sk-fallback-key") };
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
 
-        std::env::remove_var("API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("API_KEY") };
     }
 
     #[test]
@@ -13111,11 +13339,13 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "anthropic");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "anthropic") };
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
     }
 
     #[test]
@@ -13123,12 +13353,15 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
-        std::env::set_var("ZEROCLAW_MODEL_PROVIDER", "openai-codex");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_MODEL_PROVIDER", "openai-codex") };
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openai-codex"));
 
-        std::env::remove_var("ZEROCLAW_MODEL_PROVIDER");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_MODEL_PROVIDER") };
     }
 
     #[test]
@@ -13167,10 +13400,14 @@ requires_openai_auth = true
             SkillsPromptInjectionMode::Full
         );
 
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
-        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "yes");
-        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "yes") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact") };
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -13184,10 +13421,14 @@ requires_openai_auth = true
             SkillsPromptInjectionMode::Compact
         );
 
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
-        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
-        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE") };
     }
 
     #[test]
@@ -13198,9 +13439,12 @@ requires_openai_auth = true
         config.skills.allow_scripts = true;
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
-        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "maybe");
-        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "maybe") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid") };
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -13209,9 +13453,12 @@ requires_openai_auth = true
             config.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Compact
         );
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
-        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE") };
     }
 
     #[test]
@@ -13219,12 +13466,15 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
-        std::env::set_var("PROVIDER", "openai");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("PROVIDER", "openai") };
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
 
-        std::env::remove_var("PROVIDER");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("PROVIDER") };
     }
 
     #[test]
@@ -13235,15 +13485,18 @@ requires_openai_auth = true
             ..Config::default()
         };
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
-        std::env::set_var("PROVIDER", "openrouter");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("PROVIDER", "openrouter") };
         config.apply_env_overrides();
         assert_eq!(
             config.default_provider.as_deref(),
             Some("custom:https://proxy.example.com/v1")
         );
 
-        std::env::remove_var("PROVIDER");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("PROVIDER") };
     }
 
     #[test]
@@ -13254,13 +13507,17 @@ requires_openai_auth = true
             ..Config::default()
         };
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "openrouter");
-        std::env::set_var("PROVIDER", "anthropic");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "openrouter") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("PROVIDER", "anthropic") };
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
-        std::env::remove_var("PROVIDER");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("PROVIDER") };
     }
 
     #[test]
@@ -13271,11 +13528,13 @@ requires_openai_auth = true
             ..Config::default()
         };
 
-        std::env::set_var("GLM_API_KEY", "glm-regional-key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("GLM_API_KEY", "glm-regional-key") };
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
 
-        std::env::remove_var("GLM_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GLM_API_KEY") };
     }
 
     #[test]
@@ -13286,11 +13545,13 @@ requires_openai_auth = true
             ..Config::default()
         };
 
-        std::env::set_var("ZAI_API_KEY", "zai-regional-key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZAI_API_KEY", "zai-regional-key") };
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("zai-regional-key"));
 
-        std::env::remove_var("ZAI_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZAI_API_KEY") };
     }
 
     #[test]
@@ -13298,11 +13559,13 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_MODEL", "gpt-4o");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_MODEL", "gpt-4o") };
         config.apply_env_overrides();
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
 
-        std::env::remove_var("ZEROCLAW_MODEL");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_MODEL") };
     }
 
     #[test]
@@ -13361,9 +13624,11 @@ requires_openai_auth = true
             ..Config::default()
         };
 
-        std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key") };
         config.apply_env_overrides();
-        std::env::remove_var("OPENAI_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
 
         assert_eq!(config.default_provider.as_deref(), Some("openai-codex"));
         assert_eq!(config.api_url.as_deref(), Some("https://api.tonsof.blue"));
@@ -13379,8 +13644,10 @@ requires_openai_auth = true
         let resolved_config_path = temp_home.join(".zeroclaw").join("config.toml");
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
 
         let mut config = Config::default();
         config.workspace_dir = workspace_dir;
@@ -13395,11 +13662,14 @@ requires_openai_auth = true
         let parsed = parse_test_config(&saved);
         assert_eq!(parsed.default_temperature, 0.5);
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = tokio::fs::remove_dir_all(temp_home).await;
     }
@@ -13432,9 +13702,11 @@ requires_openai_auth = true
             ..Config::default()
         };
 
-        std::env::set_var("OLLAMA_API_KEY", "ollama-env-key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OLLAMA_API_KEY", "ollama-env-key") };
         let result = config.validate();
-        std::env::remove_var("OLLAMA_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OLLAMA_API_KEY") };
 
         assert!(result.is_ok(), "expected validation to pass: {result:?}");
     }
@@ -13462,9 +13734,11 @@ requires_openai_auth = true
         };
 
         let error = config.validate().expect_err("expected validation failure");
-        assert!(error
-            .to_string()
-            .contains("wire_api must be one of: responses, chat_completions"));
+        assert!(
+            error
+                .to_string()
+                .contains("wire_api must be one of: responses, chat_completions")
+        );
     }
 
     #[test]
@@ -13472,15 +13746,18 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_MODEL");
-        std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_MODEL") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet") };
         config.apply_env_overrides();
         assert_eq!(
             config.default_model.as_deref(),
             Some("anthropic/claude-3.5-sonnet")
         );
 
-        std::env::remove_var("MODEL");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("MODEL") };
     }
 
     #[test]
@@ -13488,11 +13765,13 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace") };
         config.apply_env_overrides();
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
     }
 
     #[test]
@@ -13502,7 +13781,8 @@ requires_openai_auth = true
         let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -13512,7 +13792,8 @@ requires_openai_auth = true
         assert_eq!(config_dir, workspace_dir);
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -13533,8 +13814,10 @@ requires_openai_auth = true
             .await
             .unwrap();
 
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -13548,7 +13831,8 @@ requires_openai_auth = true
             explicit_config_dir.join("workspace")
         );
 
-        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -13560,7 +13844,8 @@ requires_openai_auth = true
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         fs::create_dir_all(&default_config_dir).await.unwrap();
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
@@ -13587,7 +13872,8 @@ requires_openai_auth = true
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -13608,8 +13894,10 @@ requires_openai_auth = true
         let workspace_dir = temp_home.join("profile-a");
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -13617,11 +13905,14 @@ requires_openai_auth = true
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -13635,8 +13926,10 @@ requires_openai_auth = true
         let legacy_config_path = temp_home.join(".zeroclaw").join("config.toml");
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -13644,11 +13937,14 @@ requires_openai_auth = true
         assert_eq!(config.config_path, legacy_config_path);
         assert!(config.config_path.exists());
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -13673,8 +13969,10 @@ default_model = "legacy-model"
         .unwrap();
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -13682,11 +13980,14 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -13702,8 +14003,10 @@ default_model = "legacy-model"
         fs::create_dir_all(&config_dir).await.unwrap();
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
 
         let mut config = Config::default();
         config.config_path = config_path.clone();
@@ -13728,9 +14031,11 @@ default_model = "legacy-model"
         assert_eq!(feishu.verification_token.as_deref(), Some("feishu-verify"));
 
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -13765,8 +14070,10 @@ default_model = "legacy-model"
         // must override HOME here. The persist above already wrote to the
         // correct temp location, so no stale marker can leak.
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -13775,9 +14082,11 @@ default_model = "legacy-model"
         assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
 
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -13805,19 +14114,24 @@ default_model = "legacy-model"
             .unwrap();
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -13865,8 +14179,10 @@ default_model = "persisted-profile"
         .unwrap();
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
 
         let capture = SharedLogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
@@ -13890,11 +14206,14 @@ default_model = "persisted-profile"
         assert!(logs.contains("initialized=true"), "{logs}");
         assert!(!logs.contains("initialized=false"), "{logs}");
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
         } else {
-            std::env::remove_var("HOME");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -13905,11 +14224,13 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "") };
         config.apply_env_overrides();
         assert_eq!(config.default_provider, original_provider);
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
     }
 
     #[test]
@@ -13918,11 +14239,13 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 42617);
 
-        std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080") };
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 8080);
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_PORT") };
     }
 
     #[test]
@@ -13930,12 +14253,15 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
-        std::env::set_var("PORT", "9000");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_PORT") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("PORT", "9000") };
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 9000);
 
-        std::env::remove_var("PORT");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("PORT") };
     }
 
     #[test]
@@ -13944,11 +14270,13 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
-        std::env::set_var("ZEROCLAW_GATEWAY_HOST", "0.0.0.0");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_GATEWAY_HOST", "0.0.0.0") };
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_HOST") };
     }
 
     #[test]
@@ -13956,12 +14284,15 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
-        std::env::set_var("HOST", "0.0.0.0");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_HOST") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOST", "0.0.0.0") };
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
 
-        std::env::remove_var("HOST");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("HOST") };
     }
 
     #[test]
@@ -13970,15 +14301,18 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         assert!(config.gateway.require_pairing);
 
-        std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "false");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "false") };
         config.apply_env_overrides();
         assert!(!config.gateway.require_pairing);
 
-        std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "true");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "true") };
         config.apply_env_overrides();
         assert!(config.gateway.require_pairing);
 
-        std::env::remove_var("ZEROCLAW_REQUIRE_PAIRING");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_REQUIRE_PAIRING") };
     }
 
     #[test]
@@ -13986,31 +14320,36 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5") };
         config.apply_env_overrides();
         assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
 
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_TEMPERATURE") };
     }
 
     #[test]
     async fn env_override_temperature_out_of_range_ignored() {
         let _env_guard = env_override_lock().await;
         // Clean up any leftover env vars from other tests
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_TEMPERATURE") };
 
         let mut config = Config::default();
         let original_temp = config.default_temperature;
 
         // Temperature > 2.0 should be ignored
-        std::env::set_var("ZEROCLAW_TEMPERATURE", "3.0");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_TEMPERATURE", "3.0") };
         config.apply_env_overrides();
         assert!(
             (config.default_temperature - original_temp).abs() < f64::EPSILON,
             "Temperature 3.0 should be ignored (out of range)"
         );
 
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_TEMPERATURE") };
     }
 
     #[test]
@@ -14019,15 +14358,18 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         assert_eq!(config.runtime.reasoning_enabled, None);
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "false");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_REASONING_ENABLED", "false") };
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "true");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_REASONING_ENABLED", "true") };
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(true));
 
-        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_REASONING_ENABLED") };
     }
 
     #[test]
@@ -14036,11 +14378,13 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         config.runtime.reasoning_enabled = Some(false);
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "maybe");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_REASONING_ENABLED", "maybe") };
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_REASONING_ENABLED") };
     }
 
     #[test]
@@ -14049,11 +14393,13 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         assert_eq!(config.runtime.reasoning_effort, None);
 
-        std::env::set_var("ZEROCLAW_REASONING_EFFORT", "HIGH");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_REASONING_EFFORT", "HIGH") };
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("high"));
 
-        std::env::remove_var("ZEROCLAW_REASONING_EFFORT");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_REASONING_EFFORT") };
     }
 
     #[test]
@@ -14061,11 +14407,13 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_CODEX_REASONING_EFFORT", "minimal");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_CODEX_REASONING_EFFORT", "minimal") };
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("minimal"));
 
-        std::env::remove_var("ZEROCLAW_CODEX_REASONING_EFFORT");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_CODEX_REASONING_EFFORT") };
     }
 
     #[test]
@@ -14074,11 +14422,13 @@ default_model = "persisted-profile"
         let mut config = Config::default();
         let original_port = config.gateway.port;
 
-        std::env::set_var("PORT", "not_a_number");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("PORT", "not_a_number") };
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, original_port);
 
-        std::env::remove_var("PORT");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("PORT") };
     }
 
     #[test]
@@ -14086,11 +14436,16 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("WEB_SEARCH_ENABLED", "false");
-        std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
-        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
-        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
-        std::env::set_var("BRAVE_API_KEY", "brave-test-key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("WEB_SEARCH_ENABLED", "false") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("WEB_SEARCH_PROVIDER", "brave") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("BRAVE_API_KEY", "brave-test-key") };
 
         config.apply_env_overrides();
 
@@ -14103,11 +14458,16 @@ default_model = "persisted-profile"
             Some("brave-test-key")
         );
 
-        std::env::remove_var("WEB_SEARCH_ENABLED");
-        std::env::remove_var("WEB_SEARCH_PROVIDER");
-        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
-        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
-        std::env::remove_var("BRAVE_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("WEB_SEARCH_ENABLED") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("WEB_SEARCH_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("WEB_SEARCH_MAX_RESULTS") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("BRAVE_API_KEY") };
     }
 
     #[test]
@@ -14117,16 +14477,20 @@ default_model = "persisted-profile"
         let original_max_results = config.web_search.max_results;
         let original_timeout = config.web_search.timeout_secs;
 
-        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "99");
-        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "0");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("WEB_SEARCH_MAX_RESULTS", "99") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "0") };
 
         config.apply_env_overrides();
 
         assert_eq!(config.web_search.max_results, original_max_results);
         assert_eq!(config.web_search.timeout_secs, original_timeout);
 
-        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
-        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("WEB_SEARCH_MAX_RESULTS") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS") };
     }
 
     #[test]
@@ -14134,9 +14498,12 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "qdrant");
-        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "http://localhost:6333");
-        std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "qdrant") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "http://localhost:6333") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15") };
 
         config.apply_env_overrides();
 
@@ -14150,9 +14517,12 @@ default_model = "persisted-profile"
             Some(15)
         );
 
-        std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER");
-        std::env::remove_var("ZEROCLAW_STORAGE_DB_URL");
-        std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_STORAGE_DB_URL") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS") };
     }
 
     #[test]
@@ -14177,13 +14547,19 @@ default_model = "persisted-profile"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        std::env::set_var(
-            "ZEROCLAW_PROXY_SERVICES",
-            "provider.openai, tool.http_request",
-        );
-        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "services");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::set_var(
+                "ZEROCLAW_PROXY_SERVICES",
+                "provider.openai, tool.http_request",
+            );
+        }
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROXY_SCOPE", "services") };
 
         config.apply_env_overrides();
 
@@ -14206,11 +14582,16 @@ default_model = "persisted-profile"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "environment");
-        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        std::env::set_var("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
-        std::env::set_var("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROXY_SCOPE", "environment") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1") };
 
         config.apply_env_overrides();
 
@@ -14223,9 +14604,11 @@ default_model = "persisted-profile"
             std::env::var("HTTPS_PROXY").ok().as_deref(),
             Some("http://127.0.0.1:7891")
         );
-        assert!(std::env::var("NO_PROXY")
-            .ok()
-            .is_some_and(|value| value.contains("localhost")));
+        assert!(
+            std::env::var("NO_PROXY")
+                .ok()
+                .is_some_and(|value| value.contains("localhost"))
+        );
 
         clear_proxy_env_test_vars();
     }
@@ -14245,8 +14628,8 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    async fn google_workspace_allowed_operations_reject_duplicate_service_resource_sub_resource_entries(
-    ) {
+    async fn google_workspace_allowed_operations_reject_duplicate_service_resource_sub_resource_entries()
+     {
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![
             GoogleWorkspaceAllowedOperation {
@@ -14571,6 +14954,7 @@ default_model = "persisted-profile"
             webhook_secret: Some("webhook-secret".into()),
             allowed_users: vec!["user_a".into(), "*".into()],
             proxy_url: None,
+            bot_name: None,
         };
 
         let json = serde_json::to_string(&nc).unwrap();
